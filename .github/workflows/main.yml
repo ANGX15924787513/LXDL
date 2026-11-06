@@ -7,6 +7,10 @@ on:
       - ".github/workflows/build-apk.yml"
   workflow_dispatch:
 
+# 新增：允许 Action 创建 Release
+permissions:
+  contents: write
+
 jobs:
   apk:
     runs-on: ubuntu-latest
@@ -18,23 +22,13 @@ jobs:
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "21"
+          java-version: "21" # 记得保持你的 Java 21
 
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
           channel: stable
           cache: true
-
-      - name: Cache Gradle
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.gradle/caches
-            ~/.gradle/wrapper
-          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
-          restore-keys: |
-            ${{ runner.os }}-gradle-
 
       - name: Install dependencies
         working-directory: flutter_app
@@ -44,8 +38,21 @@ jobs:
         working-directory: flutter_app
         run: flutter build apk --release
 
-      - name: Upload APK
+      # 可选：保留 Artifacts 作为备用
+      - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: lxdl-apk
           path: flutter_app/build/app/outputs/flutter-apk/*.apk
+
+      # 新增：自动发布到 Release
+      - name: Publish Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "build-${{ github.run_number }}" # 每次运行生成一个新的版本号
+          name: "LXDL 自动构建 v${{ github.run_number }}"
+          files: flutter_app/build/app/outputs/flutter-apk/app-release.apk
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
