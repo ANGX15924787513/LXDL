@@ -1,4 +1,4 @@
-package com.lxdl.lxdl
+package com.example.lxdl
 
 import io.flutter.embedding.android.FlutterActivity
 
