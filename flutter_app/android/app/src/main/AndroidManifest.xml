@@ -44,7 +44,7 @@
             android:value="2" />
 
         <service
-            android:name="com.lxdl.native.DownloadService"
+            android:name="com.lxdl.engine.DownloadService"
             android:foregroundServiceType="dataSync"
             android:exported="false"/>
     </application>

@@ -1,4 +1,4 @@
-package com.lxdl.native
+package com.lxdl.engine
 
 import android.Manifest
 import android.app.Activity

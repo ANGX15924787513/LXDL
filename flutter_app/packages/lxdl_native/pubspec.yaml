@@ -14,5 +14,5 @@ flutter:
   plugin:
     platforms:
       android:
-        package: com.lxdl.native
+        package: com.lxdl.engine
         pluginClass: LxdlPlugin
