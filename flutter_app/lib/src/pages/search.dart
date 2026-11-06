@@ -281,8 +281,12 @@ class _SearchPageState extends State<SearchPage> {
             padding: const EdgeInsets.only(top: 8),
             child: Text(_error!, style: TextStyle(color: Theme.of(context).colorScheme.error)),
           ),
-        if (_results.isNotEmpty)
-          SizedBox(
+        AnimatedSize(
+          duration: const Duration(milliseconds: 220),
+          curve: Curves.easeOut,
+          child: _results.isEmpty
+              ? const SizedBox.shrink()
+              : SizedBox(
             height: 200,
             child: ListView.builder(
               itemCount: _results.length,
@@ -302,7 +306,25 @@ class _SearchPageState extends State<SearchPage> {
               },
             ),
           ),
-        if (_preview != null) _previewCard(_preview!),
+        ),
+        AnimatedSwitcher(
+          duration: const Duration(milliseconds: 260),
+          switchInCurve: Curves.easeOut,
+          switchOutCurve: Curves.easeIn,
+          transitionBuilder: (child, anim) => FadeTransition(
+            opacity: anim,
+            child: ScaleTransition(
+              scale: Tween<double>(begin: 0.97, end: 1).animate(anim),
+              child: child,
+            ),
+          ),
+          child: _preview == null
+              ? const SizedBox.shrink(key: ValueKey('empty'))
+              : KeyedSubtree(
+                  key: ValueKey('${_preview!['id']}-${_preview!['title']}'),
+                  child: _previewCard(_preview!),
+                ),
+        ),
       ],
     );
   }

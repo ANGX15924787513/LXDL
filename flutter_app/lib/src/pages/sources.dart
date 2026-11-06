@@ -64,16 +64,40 @@ class _SourcesPageState extends State<SourcesPage> {
     } catch (_) {}
   }
 
-  Future<void> _import() async {
+  bool _importing = false;
+
+  /// 系统文件选择器导入 .js
+  Future<void> _pick() async {
+    if (_importing) return;
+    setState(() {
+      _importing = true;
+      _status = '选择音源文件…';
+    });
+    try {
+      final raw = await Bridge.call('pickSource') as String?;
+      final list = (jsonDecode(raw ?? '[]') as List).cast<Map<String, dynamic>>();
+      setState(() {
+        _items = list;
+        _status = '已导入 ${list.length} 个音源';
+      });
+    } catch (e) {
+      setState(() => _status = e.toString().contains('没有选择') ? '已取消' : '$e');
+    } finally {
+      if (mounted) setState(() => _importing = false);
+    }
+  }
+
+  /// 备用：粘贴脚本或 URL
+  Future<void> _paste() async {
     final text = TextEditingController();
     final ok = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text('导入音源'),
+        title: const Text('粘贴音源'),
         content: TextField(
           controller: text,
           maxLines: 6,
-          decoration: const InputDecoration(hintText: '粘贴脚本或 URL'),
+          decoration: const InputDecoration(hintText: '脚本内容或 URL'),
         ),
         actions: [
           TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('取消')),
@@ -147,11 +171,33 @@ class _SourcesPageState extends State<SourcesPage> {
       Padding(
         padding: const EdgeInsets.fromLTRB(12, 6, 12, 0),
         child: Row(children: [
-          Expanded(child: Text(_status, style: Theme.of(context).textTheme.labelSmall)),
+          Expanded(
+            child: AnimatedSwitcher(
+              duration: const Duration(milliseconds: 220),
+              child: Text(
+                _status,
+                key: ValueKey(_status),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: Theme.of(context).textTheme.labelSmall,
+              ),
+            ),
+          ),
+          IconButton(
+            tooltip: '粘贴',
+            onPressed: _paste,
+            icon: const Icon(Icons.content_paste, size: 18),
+          ),
           TextButton(onPressed: _load, child: const Text('刷新')),
           FilledButton.tonalIcon(
-            onPressed: _import,
-            icon: const Icon(Icons.add, size: 16),
+            onPressed: _importing ? null : _pick,
+            icon: _importing
+                ? const SizedBox(
+                    width: 14,
+                    height: 14,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Icon(Icons.folder_open, size: 16),
             label: const Text('导入'),
           ),
         ]),
@@ -168,7 +214,18 @@ class _SourcesPageState extends State<SourcesPage> {
                   final ver = s['version'] as String? ?? '';
                   final author = s['author'] as String? ?? '';
                   final detail = [if (ver.isNotEmpty) 'v$ver', if (author.isNotEmpty) author].join(' · ');
-                  return Container(
+                  return TweenAnimationBuilder<double>(
+                    key: ValueKey('$name-$i'),
+                    tween: Tween(begin: 0.0, end: 1.0),
+                    duration: const Duration(milliseconds: 200),
+                    builder: (_, value, child) => Opacity(
+                      opacity: value,
+                      child: Transform.translate(
+                        offset: Offset(0, (1 - value) * 8),
+                        child: child,
+                      ),
+                    ),
+                    child: Container(
                     margin: const EdgeInsets.only(bottom: 6),
                     decoration: BoxDecoration(
                       color: Colors.white,
@@ -197,6 +254,7 @@ class _SourcesPageState extends State<SourcesPage> {
                         ),
                       ]),
                     ),
+                  ),
                   );
                 },
               ),

@@ -55,12 +55,22 @@ class _LxdlAppState extends State<LxdlApp> {
       home: Builder(
         builder: (context) => Scaffold(
           body: SafeArea(
-            child: IndexedStack(
-              index: _tab,
+            child: Stack(
               children: [
-                SearchPage(tick: _tick, onStarted: () => setState(() => _tab = 1)),
-                DownloadsPage(tick: _tick),
-                const SourcesPage(),
+                for (var i = 0; i < 3; i++)
+                  IgnorePointer(
+                    ignoring: _tab != i,
+                    child: AnimatedOpacity(
+                      opacity: _tab == i ? 1 : 0,
+                      duration: const Duration(milliseconds: 180),
+                      curve: Curves.easeOut,
+                      child: i == 0
+                          ? SearchPage(tick: _tick, onStarted: () => setState(() => _tab = 1))
+                          : i == 1
+                              ? DownloadsPage(tick: _tick)
+                              : const SourcesPage(),
+                    ),
+                  ),
               ],
             ),
           ),

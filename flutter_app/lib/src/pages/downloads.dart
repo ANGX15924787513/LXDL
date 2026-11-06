@@ -112,7 +112,9 @@ class _DownloadsPageState extends State<DownloadsPage> {
                 ? '已删除'
                 : (error.isEmpty ? '失败' : error);
 
-    return Container(
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 260),
+      curve: Curves.easeOut,
       margin: const EdgeInsets.only(bottom: 8),
       padding: const EdgeInsets.all(10),
       decoration: BoxDecoration(color: color, borderRadius: BorderRadius.circular(10)),
@@ -124,7 +126,12 @@ class _DownloadsPageState extends State<DownloadsPage> {
               Text(artist, maxLines: 1, overflow: TextOverflow.ellipsis,
                   style: Theme.of(context).textTheme.bodySmall),
               const SizedBox(height: 6),
-              LinearProgressIndicator(value: progress <= 0 ? null : progress, minHeight: 5),
+              TweenAnimationBuilder<double>(
+                tween: Tween(begin: 0, end: progress.clamp(0.0, 1.0)),
+                duration: const Duration(milliseconds: 300),
+                builder: (_, value, __) =>
+                    LinearProgressIndicator(value: value <= 0 ? null : value, minHeight: 5),
+              ),
               const SizedBox(height: 4),
               Text(statusText, style: Theme.of(context).textTheme.labelSmall),
             ])

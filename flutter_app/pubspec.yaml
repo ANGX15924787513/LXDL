@@ -7,6 +7,8 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
+  lxdl_native:
+    path: packages/lxdl_native
 dev_dependencies:
   flutter_test:
     sdk: flutter

@@ -4,7 +4,7 @@
 
 ## 功能
 
-- 导入洛雪音源脚本（粘贴脚本或 URL），列表里 ↑↓ 调整优先级
+- 导入洛雪音源脚本（**系统文件选择器**选 .js，也支持粘贴脚本/URL），列表里 ↑↓ 调整优先级
 - 搜索歌曲/歌单（网易云、QQ、酷狗；酷我/咪咕用链接解析或手填 id）
 - 粘贴分享链接解析成歌曲/歌单 id
 - 确认卡片：封面、歌名、歌手、音质（默认 320k）、命名方案（歌名-歌手 / 歌手-歌名 / 仅歌名）、下载目录
@@ -15,22 +15,26 @@
 ## 架构
 
 ```
-lib/                       Flutter UI（3 页 + 底部导航）
+lib/                       Flutter UI（3 页 + 底部导航 + 过渡动画）
   src/bridge.dart          MethodChannel 封装
   src/pages/search.dart    搜索 / 解析 / 确认卡片
   src/pages/downloads.dart 下载列表
-  src/pages/sources.dart   音源排序 + 镜像/代理配置
-android/app/src/main/kotlin/com/lxdl/app/
-  MainActivity.kt          FlutterActivity、通道、下载任务
-  Engine.kt                隐藏 WebView 跑洛雪脚本 + 取链 + 下载 + 导出
-  Providers.kt             平台搜索/详情/歌词/歌单/链接解析
-  Http.kt                  OkHttp（代理、流式下载）
-  Tagger.kt                jaudiotagger 写标签
-  Crypto.kt                md5 / aes / rsa / randomBytes
-  Repo.kt                  配置、音源、下载列表（JSON 持久化）
-  Exporter.kt              导出到 Download（MediaStore）
+  src/pages/sources.dart   音源排序、镜像/代理、文件导入
+packages/lxdl_native/      本地 Flutter 插件（自动注册，不依赖 MainActivity）
+  android/src/main/kotlin/com/lxdl/native/
+    LxdlPlugin.kt          通道、生命周期、系统文件选择器、下载任务
+    Engine.kt              隐藏 WebView 跑洛雪脚本 + 取链 + 下载 + 导出
+    Providers.kt           平台搜索/详情/歌词/歌单/链接解析
+    Http.kt                OkHttp（代理、流式下载）
+    Tagger.kt              jaudiotagger 写标签
+    Crypto.kt              md5 / aes / rsa / randomBytes
+    Repo.kt                配置、音源、下载列表（JSON 持久化）
+    Exporter.kt            导出到 Download（MediaStore）
 assets/lx_host.html        JS 侧 lx 协议 shim（Buffer / URL / 定时器 polyfill）
 ```
+
+用插件而不是自定义 Activity：`MainActivity` 被 Flutter 模板重新生成时会丢代码，
+插件的 `onAttachedToEngine` 由 Flutter 自动调用，通道不会再丢。
 
 洛雪脚本运行在系统 WebView 里（完整 ES2020），`lx.request` 通过
 `@JavascriptInterface` 回到 Kotlin 发 HTTP，结果再 `evaluateJavascript` 回调。
