@@ -363,7 +363,7 @@ class Engine(
      * 只解析直链，不下载。批量下载时先把所有歌的链接并发预取出来，
      * 下载线程一拿到任务就直接开跑，不用现场等链接。
      */
-    suspend fun prepare(item: Track): Prepared? = withContext(Dispatchers.IO) {
+    internal suspend fun prepare(item: Track): Prepared? = withContext(Dispatchers.IO) {
         val meta = mergeMeta(item)
         val entries = orderedSources(item.platform)
         if (entries.isEmpty()) return@withContext null
@@ -395,7 +395,7 @@ class Engine(
         )
     }
 
-    suspend fun downloadPrepared(
+    internal suspend fun downloadPrepared(
         item: Track,
         key: Int,
         control: DownloadControl,
