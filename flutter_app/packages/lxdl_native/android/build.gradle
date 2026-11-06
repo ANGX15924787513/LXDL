@@ -1,4 +1,4 @@
-group 'com.lxdl.native'
+group 'com.lxdl.engine'
 version '1.0.0'
 
 buildscript {
@@ -27,6 +27,18 @@ android {
 
     sourceSets {
         main.java.srcDirs += 'src/main/kotlin'
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_11
+        targetCompatibility JavaVersion.VERSION_11
+    }
+}
+
+// 与 app 的 Kotlin jvmTarget 保持一致，避免 Java/Kotlin 目标不匹配
+kotlin {
+    compilerOptions {
+        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_11)
     }
 }
 
