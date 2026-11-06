@@ -218,8 +218,11 @@ class Engine(
                 headers.keys().forEach { k -> builder.header(k, headers.optString(k)) }
             }
             // 表单 POST 要靠请求头里的 Content-Type，别被默认的 octet-stream 盖掉
+            // 注意 JSONObject.keys() 是 Iterator，没有带 predicate 的 firstOrNull，先转成 Sequence
             val ctype = headers?.let { h ->
-                h.keys().firstOrNull { it.equals("content-type", true) }?.let { h.optString(it) }
+                h.keys().asSequence()
+                    .firstOrNull { k -> k.equals("content-type", true) }
+                    ?.let { k -> h.optString(k) }
             }?.takeIf { it.isNotBlank() } ?: "application/octet-stream"
             val media = runCatching { ctype.toMediaType() }.getOrNull()
                 ?: "application/octet-stream".toMediaType()
