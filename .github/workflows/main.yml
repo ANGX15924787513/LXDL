@@ -23,14 +23,19 @@ jobs:
           channel: stable
           cache: true
 
-      - name: 补齐 Gradle wrapper
+      - name: 对齐 Gradle/AGP（用 Flutter 模板的脚手架）
         run: |
-          flutter create --platforms=android --org com.lxdl --project-name lxdl /tmp/tpl
-          mkdir -p flutter_app/android/gradle/wrapper
-          cp /tmp/tpl/android/gradle/wrapper/gradle-wrapper.jar flutter_app/android/gradle/wrapper/
-          cp /tmp/tpl/android/gradle/wrapper/gradle-wrapper.properties flutter_app/android/gradle/wrapper/
-          cp /tmp/tpl/android/gradlew flutter_app/android/
-          chmod +x flutter_app/android/gradlew
+          flutter create --platforms=android --org com.lxdl --project-name app /tmp/tpl
+          cd flutter_app
+          rm -f android/settings.gradle android/settings.gradle.kts \
+                android/build.gradle android/build.gradle.kts android/gradle.properties
+          for f in settings.gradle settings.gradle.kts build.gradle build.gradle.kts gradle.properties; do
+            if [ -f "/tmp/tpl/android/$f" ]; then cp "/tmp/tpl/android/$f" android/; fi
+          done
+          rm -rf android/gradle android/gradlew android/gradlew.bat
+          cp -r /tmp/tpl/android/gradle android/gradle
+          cp /tmp/tpl/android/gradlew android/gradlew
+          chmod +x android/gradlew
 
       - name: pub get
         working-directory: flutter_app
