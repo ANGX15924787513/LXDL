@@ -1,0 +1,46 @@
+name: build-apk
+
+on:
+  push:
+    paths:
+      - "flutter_app/**"
+      - ".github/workflows/build-apk.yml"
+  workflow_dispatch:
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: 补齐 Gradle wrapper
+        run: |
+          flutter create --platforms=android --org com.lxdl --project-name lxdl /tmp/tpl
+          mkdir -p flutter_app/android/gradle/wrapper
+          cp /tmp/tpl/android/gradle/wrapper/gradle-wrapper.jar flutter_app/android/gradle/wrapper/
+          cp /tmp/tpl/android/gradle/wrapper/gradle-wrapper.properties flutter_app/android/gradle/wrapper/
+          cp /tmp/tpl/android/gradlew flutter_app/android/
+          chmod +x flutter_app/android/gradlew
+
+      - name: pub get
+        working-directory: flutter_app
+        run: flutter pub get
+
+      - name: build apk
+        working-directory: flutter_app
+        run: flutter build apk --release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lxdl-apk
+          path: flutter_app/build/app/outputs/flutter-apk/*.apk

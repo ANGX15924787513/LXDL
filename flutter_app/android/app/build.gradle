@@ -6,12 +6,13 @@ plugins {
 
 android {
     namespace "com.lxdl.app"
-    compileSdk 34
+    // 跟随当前 Flutter 的推荐值，避免和引擎 AAR 的 compileSdk 要求打架
+    compileSdk flutter.compileSdkVersion
 
     defaultConfig {
         applicationId "com.lxdl.app"
-        minSdk 24
-        targetSdk 34
+        minSdk 26
+        targetSdk flutter.targetSdkVersion
         versionCode 1
         versionName "1.0"
     }
@@ -23,15 +24,16 @@ android {
         }
     }
 
-    compileOptions {
-        sourceCompatibility JavaVersion.VERSION_17
-        targetCompatibility JavaVersion.VERSION_17
-    }
-    kotlinOptions {
-        jvmTarget = "17"
-    }
-    packaging {
-        resources.excludes += ["META-INF/*.kotlin_module"]
+    packagingOptions {
+        resources {
+            excludes += [
+                "META-INF/LICENSE*",
+                "META-INF/NOTICE*",
+                "META-INF/DEPENDENCIES",
+                "META-INF/INDEX.LIST",
+                "META-INF/*.kotlin_module",
+            ]
+        }
     }
 }
 

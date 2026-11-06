@@ -229,6 +229,8 @@ class Repo(val ctx: Context) {
     private fun exists(path: String): Boolean {
         if (path.isBlank()) return false
         if (path.startsWith("/")) return File(path).isFile
+        // MediaStore.Downloads 只有 API 29+ 有
+        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.Q) return false
         val name = path.substringAfterLast('/')
         return runCatching {
             ctx.contentResolver.query(

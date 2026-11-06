@@ -63,19 +63,27 @@ git push
 ### 本地（Windows / macOS / Linux）
 
 ```bash
-# Flutter 3.22+ / JDK 17 / Android SDK 34
+# Flutter 3.22+ / JDK 17 / Android SDK（版本跟随 Flutter）
 cd flutter_app
+
+# 仓库里没带 Gradle wrapper，先从模板补一份（版本与你的 Flutter 匹配）
+flutter create --platforms=android --org com.lxdl --project-name app /tmp/tpl
+cp -r /tmp/tpl/android/gradle android/gradle
+cp /tmp/tpl/android/gradlew android/gradlew
+
 flutter pub get
 flutter build apk --release
 # 产物：build/app/outputs/flutter-apk/app-release.apk
 ```
 
-第一次会自动生成 `android/local.properties`。
+第一次会自动生成 `android/local.properties`。如果本地的 AGP/Gradle 报版本不兼容，
+把模板的 `settings.gradle*`、`build.gradle*`、`gradle.properties` 也复制过去即可
+（CI 就是这么做的）。
 
 ## 说明
 
 - 下载目录默认是系统 Download 下的 `lxdl` 子目录，可在搜索页改（只填子目录名）
-- Android 10+ 通过 MediaStore 写入 Download，不需要存储权限；9 及以下会申请写权限
+- minSdk 26；Android 10+ 通过 MediaStore 写入 Download，不需要存储权限；9 及以下会申请写权限
 - 歌单目前只支持网易云（整单展开，不分页截断）
 - 酷我/咪咕不支持搜索，但可以用链接解析
 - 源码全部未在本机编译（本机没有 JDK/Flutter/Android SDK），首次构建如有报错属正常调试
