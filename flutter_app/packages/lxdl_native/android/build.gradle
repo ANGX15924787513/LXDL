@@ -21,8 +21,8 @@ android {
     compileSdk 35
 
     defaultConfig {
-        // 跟随 app 的 minSdk，避免 manifest merger 报错（app 建议 >= 26）
-        minSdk 21
+        // jaudiotagger 3.x 用到 java.nio.file，需要 API 26+
+        minSdk 26
     }
 
     sourceSets {
@@ -34,6 +34,6 @@ dependencies {
     implementation "org.jetbrains.kotlin:kotlin-stdlib:$kotlin_version"
     implementation 'androidx.core:core-ktx:1.13.1'
     implementation 'com.squareup.okhttp3:okhttp:4.12.0'
-    implementation 'org.jaudiotagger:jaudiotagger:2.0.3'
+    implementation 'net.jthink:jaudiotagger:3.0.1'
     implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1'
 }

@@ -26,11 +26,14 @@ object Tagger {
         if (!lyrics.isNullOrBlank()) tag.setField(FieldKey.LYRICS, lyrics)
         tag.setField(FieldKey.COMMENT, "洛雪音源 · lxdl")
         if (cover != null && cover.isNotEmpty()) {
-            val art = ArtworkFactory.getNew()
-            art.binaryData = cover
-            art.mimeType = coverMime ?: "image/jpeg"
-            art.description = "cover"
-            tag.setField(FieldKey.COVER_ART, art)
+            // 封面失败不影响文字标签
+            runCatching {
+                val art = ArtworkFactory.getNew()
+                art.binaryData = cover
+                art.mimeType = coverMime ?: "image/jpeg"
+                art.description = "cover"
+                tag.setField(art)
+            }
         }
         AudioFileIO.write(audio)
         null
