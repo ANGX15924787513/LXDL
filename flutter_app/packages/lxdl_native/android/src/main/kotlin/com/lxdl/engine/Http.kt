@@ -7,12 +7,13 @@ import okhttp3.RequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import java.io.File
+import java.io.FileOutputStream
 import java.io.IOException
 import java.net.InetSocketAddress
 import java.net.Proxy
 import java.util.concurrent.TimeUnit
 
-private const val UA =
+internal const val UA =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
 /** 单个下载任务的暂停/取消控制。 */
@@ -133,7 +134,7 @@ class Http {
                 }
                 val ctype = r.header("Content-Type") ?: ""
                 val append = existing > 0
-                part.outputStream(append = append).use { out ->
+                FileOutputStream(part, append).use { out ->
                     body.byteStream().use { input ->
                         val buf = ByteArray(64 * 1024)
                         var done = existing

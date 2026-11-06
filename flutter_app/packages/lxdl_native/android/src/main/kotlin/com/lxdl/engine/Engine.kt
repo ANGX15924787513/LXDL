@@ -435,7 +435,7 @@ class Engine(
         else -> null
     }?.takeIf { it.startsWith("http") }
 
-    private fun fetchCover(item: Track, si: SourceInfo?, fallbackUrl: String?): ByteArray? {
+    private suspend fun fetchCover(item: Track, si: SourceInfo?, fallbackUrl: String?): ByteArray? {
         var url: String? = null
         if (si != null && si.has("pic")) {
             runCatching {
@@ -449,7 +449,7 @@ class Engine(
         return runCatching { http.bytes(url!!, timeoutMs = 25_000) }.getOrNull()
     }
 
-    private fun fetchLyrics(item: Track, si: SourceInfo?): String? {
+    private suspend fun fetchLyrics(item: Track, si: SourceInfo?): String? {
         if (si != null && si.has("lyric")) {
             runCatching {
                 val v = call(item.platform, "lyric", JSONObject().put("musicInfo", musicInfo(item)), 45_000)
@@ -468,7 +468,7 @@ class Engine(
         val mmr = MediaMetadataRetriever()
         try {
             mmr.setDataSource(file.absolutePath)
-            (mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L) / 1000
+            ((mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L) / 1000).toInt()
         } finally {
             mmr.release()
         }

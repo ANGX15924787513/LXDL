@@ -31,7 +31,7 @@ import org.json.JSONObject
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 
-class LxdlPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
+class LxdlPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAware,
     PluginRegistry.ActivityResultListener {
 
     private lateinit var channel: MethodChannel
@@ -515,7 +515,7 @@ class LxdlPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
         caps?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) == true
     }.getOrDefault(true)
 
-    private fun downloadOne(t: Track, worker: Int) {
+    private suspend fun downloadOne(t: Track, worker: Int) {
         val (r, _) = base()
         val item = r.addItem(t)
         val control = DownloadControl()

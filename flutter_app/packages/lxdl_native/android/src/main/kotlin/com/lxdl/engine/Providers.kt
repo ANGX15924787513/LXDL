@@ -96,7 +96,7 @@ class Providers(private val http: Http, private val repo: Repo) {
                 title = s.optString("name"),
                 artist = join(s.optJSONArray("artists")),
                 album = s.optJSONObject("album")?.optString("name") ?: "",
-                durationSec = s.optLong("duration") / 1000
+                durationSec = (s.optLong("duration") / 1000).toInt()
             ).takeIf { it.id != "0" }
         }
     }
@@ -178,7 +178,7 @@ class Providers(private val http: Http, private val repo: Repo) {
             artist = join(s.optJSONArray("artists")),
             album = album?.optString("name") ?: "",
             cover = album?.optString("picUrl"),
-            durationSec = s.optLong("duration") / 1000
+            durationSec = (s.optLong("duration") / 1000).toInt()
         )
     }
 
@@ -312,7 +312,7 @@ class Providers(private val http: Http, private val repo: Repo) {
                         title = s.optString("name"),
                         artist = join(s.optJSONArray("ar") ?: s.optJSONArray("artists")),
                         album = s.optJSONObject("al")?.optString("name") ?: "",
-                        durationSec = (s.optLong("dt").takeIf { it > 0 } ?: s.optLong("duration")) / 1000
+                        durationSec = ((s.optLong("dt").takeIf { it > 0 } ?: s.optLong("duration")) / 1000).toInt()
                     )
                 )
             }

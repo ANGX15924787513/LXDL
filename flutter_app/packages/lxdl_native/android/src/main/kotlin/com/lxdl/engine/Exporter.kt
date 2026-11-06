@@ -58,18 +58,41 @@ object Exporter {
             tree, DocumentsContract.getTreeDocumentId(tree)
         )
         dir.split('/').filter { it.isNotBlank() }.forEach { part ->
-            val existing = DocumentsContract.findDocumentPath(resolver, parent, part)?.uri
-            parent = existing ?: run {
-                val created = DocumentsContract.createDocument(
+            parent = findChild(resolver, parent, part) ?: run {
+                DocumentsContract.createDocument(
                     resolver, parent, DocumentsContract.Document.MIME_TYPE_DIR, part
                 ) ?: throw IllegalStateException("无法创建目录 $part")
-                created
             }
         }
         val doc = DocumentsContract.createDocument(resolver, parent, mime, name)
             ?: throw IllegalStateException("无法写入文件")
         resolver.openOutputStream(doc)?.use { out -> src.inputStream().use { it.copyTo(out) } }
         return Out(name, doc.toString())
+    }
+
+    private fun findChild(
+        resolver: android.content.ContentResolver,
+        parent: Uri,
+        name: String
+    ): Uri? {
+        val children = DocumentsContract.buildChildDocumentsUriUsingTree(
+            parent, DocumentsContract.getDocumentId(parent)
+        )
+        resolver.query(
+            children,
+            arrayOf(
+                DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                DocumentsContract.Document.COLUMN_DISPLAY_NAME
+            ),
+            null, null, null
+        )?.use { c ->
+            while (c.moveToNext()) {
+                if (c.getString(1) == name) {
+                    return DocumentsContract.buildDocumentUriUsingTree(parent, c.getString(0))
+                }
+            }
+        }
+        return null
     }
 
     fun mimeFor(ext: String): String = when (ext.lowercase()) {
