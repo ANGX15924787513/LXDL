@@ -74,8 +74,10 @@ class Engine(
     }
 
     fun detach() {
-        runCatching { (web.parent as? android.view.ViewGroup)?.removeView(web) }
-        runCatching { web.destroy() }
+        main.post {
+            runCatching { (web.parent as? android.view.ViewGroup)?.removeView(web) }
+            runCatching { web.destroy() }
+        }
     }
 
     private fun log(text: String) {
@@ -109,6 +111,9 @@ class Engine(
     suspend fun loadScript(entry: SourceEntry): List<SourceInfo> = withContext(Dispatchers.IO) {
         withTimeoutOrNull(20_000) { pageReady.await() } ?: throw IllegalStateException("JS 引擎启动超时")
         if (loadedEntry == entry.file && activeSources.isNotEmpty()) return@withContext activeSources
+        if (eval("(window.__lxReady === true) ? 1 : 0") != "1") {
+            throw IllegalStateException("JS 宿主没加载起来（lx_host.html 缺失或被拦截）")
+        }
         val fresh = CompletableDeferred<JSONObject>()
         inited.set(fresh)
         val code = File(repo.sourcesDir, entry.file).readText()
@@ -212,7 +217,13 @@ class Engine(
             if (headers != null) {
                 headers.keys().forEach { k -> builder.header(k, headers.optString(k)) }
             }
-            val rb = bodyBytes?.toRequestBody("application/octet-stream".toMediaType())
+            // 表单 POST 要靠请求头里的 Content-Type，别被默认的 octet-stream 盖掉
+            val ctype = headers?.let { h ->
+                h.keys().firstOrNull { it.equals("content-type", true) }?.let { h.optString(it) }
+            }?.takeIf { it.isNotBlank() } ?: "application/octet-stream"
+            val media = runCatching { ctype.toMediaType() }.getOrNull()
+                ?: "application/octet-stream".toMediaType()
+            val rb = bodyBytes?.toRequestBody(media)
             if (rb != null) builder.method(method, rb) else builder.method(method, null)
             val call = http.client.newCall(builder.build())
             call.timeout().timeout(timeout, TimeUnit.MILLISECONDS)
@@ -322,7 +333,10 @@ class Engine(
             onStatus("下载 ${c.quality}…")
             val tmp = File(repo.cacheDir, "cand-$key-$attempts.bin")
             val ok = try {
-                http.download(c.url, tmp, control) { done, total ->
+                http.download(
+                    c.url, tmp, control,
+                    mapOf("User-Agent" to UA, "Referer" to refererOf(item.platform))
+                ) { done, total ->
                     onProgress(
                         if (total != null && total > 0) (done.toDouble() / total).coerceIn(0.0, 1.0) else 0.0,
                         done, total

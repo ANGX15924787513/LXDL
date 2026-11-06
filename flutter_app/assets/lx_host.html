@@ -72,6 +72,17 @@
     return dec.decode(b);
   }
 
+  // 让 Uint8Array 用起来像 Node 的 Buffer（音源脚本里常见 .toString('base64') / .toString('hex')）
+  Uint8Array.prototype.toString = function (encoding) {
+    return bufToString(this, encoding || 'utf8');
+  };
+  window.Buffer = {
+    from: Buf.from,
+    isBuffer: Buf.isBuffer,
+    concat: Buf.concat,
+    alloc: function (n) { return new Uint8Array(Number(n) || 0); }
+  };
+
   function normOptions(o) {
     o = o || {};
     var out = {
@@ -92,11 +103,24 @@
         return encodeURIComponent(k) + '=' + encodeURIComponent(obj[k] == null ? '' : String(obj[k]));
       }).join('&');
     }
-    if (o.form) { out.body = urlenc(o.form); out.form = true; }
-    if (o.formData) { out.body = urlenc(o.formData); out.formData = true; }
+    function formHeaders() {
+      if (!out.headers['Content-Type'] && !out.headers['content-type']) {
+        out.headers['Content-Type'] = 'application/x-www-form-urlencoded';
+      }
+    }
+    if (o.form) { out.body = urlenc(o.form); out.form = true; formHeaders(); }
+    if (o.formData) { out.body = urlenc(o.formData); out.formData = true; formHeaders(); }
     if (o.body != null) {
       if (typeof o.body === 'string') { out.body = o.body; out.bodyEncoding = 'text'; }
-      else { out.body = bytesToB64(Buf.from(o.body)); out.bodyEncoding = 'base64'; }
+      else if (o.body instanceof Uint8Array || o.body instanceof ArrayBuffer || Array.isArray(o.body)) {
+        out.body = bytesToB64(Buf.from(o.body));
+        out.bodyEncoding = 'base64';
+      } else {
+        // 普通对象按表单发
+        out.body = urlenc(o.body);
+        out.bodyEncoding = 'text';
+        formHeaders();
+      }
     }
     return JSON.stringify(out);
   }

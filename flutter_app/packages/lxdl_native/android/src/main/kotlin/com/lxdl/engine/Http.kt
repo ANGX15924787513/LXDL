@@ -16,6 +16,16 @@ import java.util.concurrent.TimeUnit
 internal const val UA =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
+/** 各平台 CDN 一般要带 Referer，否则 403。 */
+internal fun refererOf(platform: String): String = when (platform) {
+    "wy" -> "https://music.163.com/"
+    "tx" -> "https://y.qq.com/"
+    "kg" -> "https://www.kugou.com/"
+    "kw" -> "https://www.kuwo.cn/"
+    "mg" -> "https://music.migu.cn/"
+    else -> "https://music.163.com/"
+}
+
 /** 单个下载任务的暂停/取消控制。 */
 class DownloadControl {
     @Volatile var paused = false
@@ -105,12 +115,14 @@ class Http {
         url: String,
         dest: File,
         control: DownloadControl,
+        headers: Map<String, String> = emptyMap(),
         onProgress: (Long, Long?) -> Unit
     ): String {
         dest.parentFile?.mkdirs()
         val part = File(dest.absolutePath + ".part")
         var existing = if (part.isFile) part.length() else 0L
         val builder = Request.Builder().url(url).header("User-Agent", UA)
+        headers.forEach { (k, v) -> builder.header(k, v) }
         if (existing > 0) builder.header("Range", "bytes=$existing-")
         val call = _client.newBuilder()
             .callTimeout(0, TimeUnit.MILLISECONDS)

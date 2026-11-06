@@ -84,36 +84,56 @@ class Providers(private val http: Http, private val repo: Repo) {
     }
 
     private fun wySearch(kw: String, limit: Int): List<Track> {
-        val o = http.json(
-            api("https://music.163.com/api/search/get/web?s=${enc(kw)}&type=1&offset=0&limit=$limit"),
-            ref("https://music.163.com/")
-        )
-        val arr = o.optJSONObject("result")?.optJSONArray("songs") ?: JSONArray()
-        return (0 until arr.length()).mapNotNull { i ->
-            val s = arr.optJSONObject(i) ?: return@mapNotNull null
-            Track(
-                platform = "wy", id = s.optLong("id").toString(),
-                title = s.optString("name"),
-                artist = join(s.optJSONArray("artists")),
-                album = s.optJSONObject("album")?.optString("name") ?: "",
-                durationSec = (s.optLong("duration") / 1000).toInt()
-            ).takeIf { it.id != "0" }
-        }
+        val get = runCatching {
+            http.json(
+                api("https://music.163.com/api/search/get?s=${enc(kw)}&type=1&offset=0&limit=$limit"),
+                ref("https://music.163.com/")
+            ).optJSONObject("result")?.optJSONArray("songs")
+        }.getOrNull()
+        if (get != null && get.length() > 0) return parseWySongs(get)
+        // /api/search/get 偶尔被限流，退回 cloudsearch
+        val cloud = runCatching {
+            http.json(
+                api("https://music.163.com/api/cloudsearch/pc?s=${enc(kw)}&type=1&offset=0&limit=$limit"),
+                ref("https://music.163.com/")
+            ).optJSONObject("result")?.optJSONArray("songs")
+        }.getOrNull() ?: return emptyList()
+        return parseWySongs(cloud)
+    }
+
+    private fun parseWySongs(arr: JSONArray): List<Track> = (0 until arr.length()).mapNotNull { i ->
+        val s = arr.optJSONObject(i) ?: return@mapNotNull null
+        val album = s.optJSONObject("album") ?: s.optJSONObject("al")
+        val dur = s.optLong("duration").takeIf { it > 0 } ?: s.optLong("dt")
+        Track(
+            platform = "wy", id = s.optLong("id").toString(),
+            title = s.optString("name"),
+            artist = join(s.optJSONArray("artists") ?: s.optJSONArray("ar")),
+            album = album?.optString("name") ?: "",
+            cover = album?.optString("picUrl")?.ifBlank { null },
+            durationSec = (dur / 1000).toInt()
+        ).takeIf { it.id != "0" }
     }
 
     private fun wyPlaylistSearch(kw: String, limit: Int): List<Track> {
-        val o = http.json(
-            api("https://music.163.com/api/search/get/web?s=${enc(kw)}&type=1000&offset=0&limit=$limit"),
-            ref("https://music.163.com/")
-        )
-        val arr = o.optJSONObject("result")?.optJSONArray("playlists") ?: JSONArray()
+        val arr = runCatching {
+            http.json(
+                api("https://music.163.com/api/search/get?s=${enc(kw)}&type=1000&offset=0&limit=$limit"),
+                ref("https://music.163.com/")
+            ).optJSONObject("result")?.optJSONArray("playlists")
+        }.getOrNull() ?: runCatching {
+            http.json(
+                api("https://music.163.com/api/cloudsearch/pc?s=${enc(kw)}&type=1000&offset=0&limit=$limit"),
+                ref("https://music.163.com/")
+            ).optJSONObject("result")?.optJSONArray("playlists")
+        }.getOrNull() ?: return emptyList()
         return (0 until arr.length()).mapNotNull { i ->
             val p = arr.optJSONObject(i) ?: return@mapNotNull null
             Track(
                 platform = "wy", id = p.optLong("id").toString(),
                 title = p.optString("name"),
                 artist = p.optJSONObject("creator")?.optString("nickname") ?: "",
-                cover = p.optString("coverImgUrl"),
+                cover = p.optString("coverImgUrl").ifBlank { null },
                 trackCount = p.optInt("trackCount"),
                 isPlaylist = true
             )
@@ -363,11 +383,34 @@ class Providers(private val http: Http, private val repo: Repo) {
                 }
             }
         }
+        if (id == null && platform in NUMERIC_PLATFORMS) id = tailNumber(src)
         if (id == null) throw IllegalStateException("无法解析：没认出这个平台的歌曲/歌单 id")
         return Track(
             platform = platform, id = id,
             isPlaylist = playlist && platform == "wy"
         )
+    }
+
+    /**
+     * 从后往前找第一段连续数字当作歌曲 id（网易云/酷我/咪咕这类纯数字 id 的兜底）。
+     * 优先取 5 位以上的数字，避免误抓链接里的 ?t=3 这类短参数。
+     */
+    private fun tailNumber(src: String): String? {
+        var end = src.length - 1
+        var fallback: String? = null
+        while (end >= 0) {
+            if (!src[end].isDigit()) {
+                end--
+                continue
+            }
+            var start = end
+            while (start >= 0 && src[start].isDigit()) start--
+            val run = src.substring(start + 1, end + 1)
+            if (run.length >= 5) return run
+            if (fallback == null) fallback = run
+            end = start
+        }
+        return fallback
     }
 
     private fun join(arr: JSONArray?): String {
@@ -378,5 +421,10 @@ class Providers(private val http: Http, private val repo: Repo) {
             if (name.isNotBlank()) names.add(name)
         }
         return names.joinToString("/")
+    }
+
+    private companion object {
+        /** 纯数字 id 的平台，可以用尾部数字兜底 */
+        val NUMERIC_PLATFORMS = setOf("wy", "kw", "mg")
     }
 }

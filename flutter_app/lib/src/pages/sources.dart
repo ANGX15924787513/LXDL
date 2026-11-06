@@ -55,7 +55,7 @@ class _SourcesPageState extends State<SourcesPage> {
         _status = '共 ${list.length} 个音源';
       });
     } catch (e) {
-      if (mounted) setState(() => _status = '$e');
+      if (mounted) setState(() => _status = Bridge.err(e));
     }
   }
 
@@ -89,7 +89,7 @@ class _SourcesPageState extends State<SourcesPage> {
         _status = '已导入 ${list.length} 个音源';
       });
     } catch (e) {
-      setState(() => _status = e.toString().contains('没有选择') ? '已取消' : '$e');
+      setState(() => _status = e.toString().contains('没有选择') ? '已取消' : Bridge.err(e));
     } finally {
       if (mounted) setState(() => _importing = false);
     }
@@ -121,7 +121,7 @@ class _SourcesPageState extends State<SourcesPage> {
         _status = '已导入';
       });
     } catch (e) {
-      setState(() => _status = '$e');
+      setState(() => _status = Bridge.err(e));
     }
   }
 
@@ -143,7 +143,7 @@ class _SourcesPageState extends State<SourcesPage> {
         _status = '检测完成';
       });
     } catch (e) {
-      setState(() => _status = '$e');
+      setState(() => _status = Bridge.err(e));
     } finally {
       if (mounted) setState(() => _probing = false);
     }
@@ -158,7 +158,7 @@ class _SourcesPageState extends State<SourcesPage> {
       await Bridge.call('setConfig', {'json': jsonEncode(patch)});
       if (mounted) setState(() => _status = '已保存');
     } catch (e) {
-      if (mounted) setState(() => _status = '$e');
+      if (mounted) setState(() => _status = Bridge.err(e));
     }
   }
 
@@ -170,7 +170,7 @@ class _SourcesPageState extends State<SourcesPage> {
         setState(() => _status = '已选择导出目录');
       }
     } catch (e) {
-      setState(() => _status = e.toString().contains('没有选择') ? '已取消' : '$e');
+      setState(() => _status = e.toString().contains('没有选择') ? '已取消' : Bridge.err(e));
     }
   }
 

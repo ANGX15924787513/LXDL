@@ -163,7 +163,7 @@ class _SearchPageState extends State<SearchPage> {
       if (list.isNotEmpty) await _select(0);
       await _refreshMirror();
     } catch (e) {
-      setState(() => _error = '$e');
+      setState(() => _error = Bridge.err(e));
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -193,7 +193,7 @@ class _SearchPageState extends State<SearchPage> {
       });
       await _refreshMirror();
     } catch (e) {
-      setState(() => _error = '无法解析');
+      setState(() => _error = Bridge.err(e));
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -250,10 +250,13 @@ class _SearchPageState extends State<SearchPage> {
         'track': jsonEncode(t),
         'quality': _qualities[_quality],
       }) as String;
-      await Bridge.call('playPreview', {'url': url});
+      await Bridge.call('playPreview', {
+        'url': url,
+        'platform': t['platform'] ?? '',
+      });
       if (mounted) setState(() => _playing = true);
     } catch (e) {
-      if (mounted) setState(() => _error = '试听失败：$e');
+      if (mounted) setState(() => _error = '试听失败：${Bridge.err(e)}');
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -274,7 +277,7 @@ class _SearchPageState extends State<SearchPage> {
         const SnackBar(content: Text('直链已复制')),
       );
     } catch (e) {
-      if (mounted) setState(() => _error = '$e');
+      if (mounted) setState(() => _error = Bridge.err(e));
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -339,7 +342,7 @@ class _SearchPageState extends State<SearchPage> {
       });
       widget.onStarted();
     } catch (e) {
-      setState(() => _error = '$e');
+      setState(() => _error = Bridge.err(e));
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -357,7 +360,7 @@ class _SearchPageState extends State<SearchPage> {
     } catch (e) {
       setState(() {
         _busy = false;
-        _error = '展开歌单失败：$e';
+        _error = '展开歌单失败：${Bridge.err(e)}';
       });
       return;
     }
@@ -428,7 +431,7 @@ class _SearchPageState extends State<SearchPage> {
       });
       widget.onStarted();
     } catch (e) {
-      setState(() => _error = '$e');
+      setState(() => _error = Bridge.err(e));
     }
   }
 

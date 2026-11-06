@@ -18,4 +18,14 @@ class Bridge {
       return null;
     });
   }
+
+  /// 去掉 PlatformException(lxdl, …, null, null) 这层壳，只留人话。
+  static String err(Object e) {
+    if (e is PlatformException) {
+      final m = e.message?.trim();
+      if (m != null && m.isNotEmpty) return m;
+      return e.code;
+    }
+    return '$e';
+  }
 }

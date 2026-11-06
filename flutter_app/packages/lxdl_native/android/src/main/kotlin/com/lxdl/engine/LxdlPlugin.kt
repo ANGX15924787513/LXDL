@@ -20,12 +20,14 @@ import io.flutter.embedding.engine.plugins.activity.ActivityPluginBinding
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import io.flutter.plugin.common.PluginRegistry
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -126,10 +128,12 @@ class LxdlPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAware
     }
 
     private fun teardownEngines() {
-        engines.forEach { e -> runCatching { e.detach() } }
-        engines.clear()
-        runCatching { interactive?.detach() }
-        interactive = null
+        synchronized(engines) {
+            engines.forEach { e -> runCatching { e.detach() } }
+            engines.clear()
+            runCatching { interactive?.detach() }
+            interactive = null
+        }
     }
 
     // ---------------- 基础对象 ----------------
@@ -150,14 +154,21 @@ class LxdlPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAware
         return http!!
     }
 
-    /** 预览/测速/复制直链用的独立引擎，避免和下载任务抢同一个脚本上下文。 */
-    private fun interactiveEngine(): Engine = synchronized(engines) {
-        interactive ?: createEngine().also { interactive = it }
+    /**
+     * 预览/测速/复制直链用的独立引擎，避免和下载任务抢同一个脚本上下文。
+     * WebView 只能在有 Looper 的线程（主线程）创建，所以这里强制切主线程。
+     */
+    private suspend fun interactiveEngine(): Engine = withContext(Dispatchers.Main.immediate) {
+        synchronized(engines) {
+            interactive ?: createEngine().also { interactive = it }
+        }
     }
 
-    private fun engineAt(index: Int): Engine = synchronized(engines) {
-        while (engines.size <= index) engines.add(createEngine())
-        engines[index]
+    private suspend fun engineAt(index: Int): Engine = withContext(Dispatchers.Main.immediate) {
+        synchronized(engines) {
+            while (engines.size <= index) engines.add(createEngine())
+            engines[index]
+        }
     }
 
     private fun createEngine(): Engine {
@@ -395,7 +406,12 @@ class LxdlPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAware
             }
             "playPreview" -> {
                 val url = call.argument<String>("url") ?: ""
-                reply(result, playPreview(url))
+                val platform = call.argument<String>("platform") ?: ""
+                scope.launch {
+                    runCatching { playPreview(url, platform) }
+                        .onSuccess { reply(result, it) }
+                        .onFailure { fail(result, it) }
+                }
             }
             "stopPreview" -> {
                 stopPreview()
@@ -501,10 +517,17 @@ class LxdlPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAware
             return
         }
         val n = r.cfg.concurrency.coerceIn(1, 3)
-        val sem = Semaphore(n)
-        tracks.forEachIndexed { index, t ->
+        // 槽位池：一个槽对应一个 WebView 引擎，保证同时在跑的任务不会共用同一个脚本上下文
+        val slots = Channel<Int>(n)
+        repeat(n) { runCatching { slots.trySend(it) } }
+        tracks.forEach { t ->
             scope.launch {
-                sem.withPermit { downloadOne(t, index % n) }
+                val worker = slots.receive()
+                try {
+                    downloadOne(t, worker)
+                } finally {
+                    runCatching { slots.trySend(worker) }
+                }
             }
         }
     }
@@ -543,7 +566,7 @@ class LxdlPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAware
             sendEvent("log", "完成：${out.display}")
         } catch (e: Cancelled) {
             r.fail(item.key, "已取消")
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             r.fail(item.key, e.message ?: "失败")
             sendEvent("log", "失败：${e.message}")
         } finally {
@@ -555,22 +578,49 @@ class LxdlPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAware
 
     // ---------------- 播放 / 文件 ----------------
 
-    private fun playPreview(url: String): Boolean {
-        val act = activity ?: return false
-        return runCatching {
-            main.post {
-                runCatching {
-                    player?.release()
-                    player = MediaPlayer().apply {
-                        setDataSource(url)
-                        setOnPreparedListener { it.start() }
-                        prepareAsync()
+    /** 试听：带 Referer 交给 MediaPlayer，403/解码失败会真的报错而不是静默。 */
+    private suspend fun playPreview(url: String, platform: String): Boolean =
+        withContext(Dispatchers.Main.immediate) {
+            if (url.isBlank()) throw IllegalStateException("没有可播放的直链")
+            val act = activity ?: throw IllegalStateException("界面未就绪")
+            val done = CompletableDeferred<Boolean>()
+            runCatching { player?.release() }
+            player = MediaPlayer().apply {
+                setOnPreparedListener {
+                    it.start()
+                    if (!done.isCompleted) done.complete(true)
+                }
+                setOnCompletionListener { if (!done.isCompleted) done.complete(true) }
+                setOnErrorListener { _, what, extra ->
+                    if (!done.isCompleted) {
+                        done.completeExceptionally(IllegalStateException("播放器报错 $what/$extra"))
                     }
+                    true
+                }
+                try {
+                    if (url.startsWith("http")) {
+                        setDataSource(act, Uri.parse(url), previewHeaders(platform))
+                    } else {
+                        setDataSource(url)
+                    }
+                    prepareAsync()
+                } catch (e: Throwable) {
+                    if (!done.isCompleted) done.completeExceptionally(e)
                 }
             }
-            true
-        }.getOrDefault(false)
-    }
+            val ok = withTimeoutOrNull(20_000) { done.await() }
+            if (ok == null) {
+                runCatching { player?.release() }
+                player = null
+                throw IllegalStateException("试听超时（CDN 没响应）")
+            }
+            ok
+        }
+
+    private fun previewHeaders(platform: String): Map<String, String> = mapOf(
+        "User-Agent" to UA,
+        "Referer" to refererOf(platform)
+    )
 
     private fun stopPreview() {
         main.post {
