@@ -21,7 +21,8 @@ android {
     compileSdk 35
 
     defaultConfig {
-        minSdk 26
+        // 跟随 app 的 minSdk，避免 manifest merger 报错（app 建议 >= 26）
+        minSdk 21
     }
 
     sourceSets {

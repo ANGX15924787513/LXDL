@@ -13,7 +13,7 @@ class LxdlApp extends StatefulWidget {
 class _LxdlAppState extends State<LxdlApp> {
   int _tab = 0;
   final ValueNotifier<int> _tick = ValueNotifier(0);
-  final List<String> _logs = [];
+  final ValueNotifier<String> _shareIn = ValueNotifier('');
   final GlobalKey<ScaffoldMessengerState> _scaffold = GlobalKey();
   int _lastToast = 0;
 
@@ -24,11 +24,12 @@ class _LxdlAppState extends State<LxdlApp> {
     Bridge.onEvent = (type, data) {
       if (type == 'downloads' || type == 'progress') {
         _tick.value++;
+      } else if (type == 'share') {
+        _shareIn.value = data['text'] as String? ?? '';
+        setState(() => _tab = 0);
       } else if (type == 'log') {
         final text = data['text'] as String? ?? '';
         if (text.isEmpty) return;
-        _logs.add(text);
-        if (_logs.length > 200) _logs.removeAt(0);
         final important = text.contains('失败') || text.contains('不可用') || text.contains('完成');
         final now = DateTime.now().millisecondsSinceEpoch;
         if (important && now - _lastToast > 1500) {
@@ -39,6 +40,19 @@ class _LxdlAppState extends State<LxdlApp> {
         }
       }
     };
+    _takeShare();
+    // 冷启动时插件可能还没拿到 intent，稍后再取一次
+    Future.delayed(const Duration(milliseconds: 900), _takeShare);
+  }
+
+  Future<void> _takeShare() async {
+    try {
+      final text = await Bridge.call('takeShare') as String?;
+      if (text != null && text.isNotEmpty) {
+        _shareIn.value = text;
+        if (mounted) setState(() => _tab = 0);
+      }
+    } catch (_) {}
   }
 
   @override
@@ -46,12 +60,19 @@ class _LxdlAppState extends State<LxdlApp> {
     return MaterialApp(
       scaffoldMessengerKey: _scaffold,
       debugShowCheckedModeBanner: false,
-      title: '洛雪下载器',
+      title: 'lxdl',
       theme: ThemeData(
         useMaterial3: true,
         colorSchemeSeed: const Color(0xFF3A7AF0),
         visualDensity: VisualDensity.compact,
       ),
+      darkTheme: ThemeData(
+        useMaterial3: true,
+        brightness: Brightness.dark,
+        colorSchemeSeed: const Color(0xFF3A7AF0),
+        visualDensity: VisualDensity.compact,
+      ),
+      themeMode: ThemeMode.system,
       home: Builder(
         builder: (context) => Scaffold(
           body: SafeArea(
@@ -65,7 +86,11 @@ class _LxdlAppState extends State<LxdlApp> {
                       duration: const Duration(milliseconds: 180),
                       curve: Curves.easeOut,
                       child: i == 0
-                          ? SearchPage(tick: _tick, onStarted: () => setState(() => _tab = 1))
+                          ? SearchPage(
+                              tick: _tick,
+                              shareIn: _shareIn,
+                              onStarted: () => setState(() => _tab = 1),
+                            )
                           : i == 1
                               ? DownloadsPage(tick: _tick)
                               : const SourcesPage(),

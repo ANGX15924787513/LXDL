@@ -35,4 +35,15 @@ object Tagger {
         AudioFileIO.write(audio)
         null
     }.getOrElse { e -> e.message ?: e.toString() }
+
+    /** 只改标题/歌手/专辑，保留其它标签。 */
+    fun retag(file: File, title: String, artist: String, album: String): String? = runCatching {
+        val audio = AudioFileIO.read(file)
+        val tag = audio.tagOrCreateAndSetDefault
+        if (title.isNotBlank()) tag.setField(FieldKey.TITLE, title)
+        if (artist.isNotBlank()) tag.setField(FieldKey.ARTIST, artist)
+        if (album.isNotBlank()) tag.setField(FieldKey.ALBUM, album)
+        AudioFileIO.write(audio)
+        null
+    }.getOrElse { e -> e.message ?: e.toString() }
 }

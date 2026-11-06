@@ -5,6 +5,9 @@ import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.media.MediaPlayer
+import android.net.Uri
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.view.ViewGroup
@@ -21,15 +24,13 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
+import java.util.concurrent.ConcurrentHashMap
 
-/**
- * Flutter 插件：通道 + 引擎。
- *
- * 用插件而不是自定义 Activity，是因为 Activity 可能被模板重新生成覆盖，
- * 而插件的 onAttachedToEngine 一定会被自动注册流程调用。
- */
 class LxdlPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
     PluginRegistry.ActivityResultListener {
 
@@ -41,33 +42,42 @@ class LxdlPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
     private var activity: Activity? = null
     private var binding: ActivityPluginBinding? = null
     private var pendingPick: MethodChannel.Result? = null
+    private var pendingDir: MethodChannel.Result? = null
 
     private var repo: Repo? = null
     private var http: Http? = null
     private var providers: Providers? = null
-    private var engine: Engine? = null
-    private var web: WebView? = null
+    private val engines = mutableListOf<Engine>()
+    private var interactive: Engine? = null
+    private val controls = ConcurrentHashMap<Int, DownloadControl>()
+    private var player: MediaPlayer? = null
+    private var pendingShare: String? = null
 
-    // ---------------- FlutterPlugin ----------------
+    // ---------------- 生命周期 ----------------
 
     override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         appCtx = binding.applicationContext
         channel = MethodChannel(binding.binaryMessenger, "lxdl/methods")
         channel.setMethodCallHandler(this)
+        Notifier.ensureChannel(appCtx)
     }
 
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         channel.setMethodCallHandler(null)
-        teardown()
+        teardownEngines()
+        Notifier.stop(appCtx)
     }
-
-    // ---------------- ActivityAware ----------------
 
     override fun onAttachedToActivity(binding: ActivityPluginBinding) {
         this.binding = binding
         activity = binding.activity
         binding.addActivityResultListener(this)
-        askLegacyStorage(binding.activity)
+        binding.addOnNewIntentListener { intent ->
+            handleShare(intent)
+            false
+        }
+        handleShare(binding.activity.intent)
+        askPermissions(binding.activity)
     }
 
     override fun onDetachedFromActivityForConfigChanges() {
@@ -83,30 +93,46 @@ class LxdlPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
         binding?.removeActivityResultListener(this)
         binding = null
         activity = null
-        teardown()
+        teardownEngines()
     }
 
-    private fun askLegacyStorage(activity: Activity) {
-        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.Q &&
+    private fun askPermissions(activity: Activity) {
+        val need = mutableListOf<String>()
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q &&
             ContextCompat.checkSelfPermission(activity, Manifest.permission.WRITE_EXTERNAL_STORAGE)
             != PackageManager.PERMISSION_GRANTED
-        ) {
-            ActivityCompat.requestPermissions(
-                activity, arrayOf(Manifest.permission.WRITE_EXTERNAL_STORAGE), 1
-            )
+        ) need.add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+        if (Build.VERSION.SDK_INT >= 33 &&
+            ContextCompat.checkSelfPermission(activity, Manifest.permission.POST_NOTIFICATIONS)
+            != PackageManager.PERMISSION_GRANTED
+        ) need.add(Manifest.permission.POST_NOTIFICATIONS)
+        if (need.isNotEmpty()) ActivityCompat.requestPermissions(activity, need.toTypedArray(), 1)
+    }
+
+    private fun handleShare(intent: Intent?) {
+        if (intent == null) return
+        val action = intent.action ?: return
+        if (action != Intent.ACTION_SEND && action != Intent.ACTION_VIEW) return
+        val text = intent.getStringExtra(Intent.EXTRA_TEXT)
+            ?: intent.dataString
+            ?: return
+        if (text.isBlank()) return
+        pendingShare = text
+        main.post {
+            runCatching {
+                channel.invokeMethod("event", JSONObject().put("type", "share").put("text", text).toString())
+            }
         }
     }
 
-    private fun teardown() {
-        web?.let { w ->
-            runCatching { (w.parent as? ViewGroup)?.removeView(w) }
-            runCatching { w.destroy() }
-        }
-        web = null
-        engine = null
+    private fun teardownEngines() {
+        engines.forEach { e -> runCatching { e.detach() } }
+        engines.clear()
+        runCatching { interactive?.detach() }
+        interactive = null
     }
 
-    // ---------------- 懒初始化 ----------------
+    // ---------------- 基础对象 ----------------
 
     private fun base(): Pair<Repo, Providers> {
         val r = repo ?: Repo(appCtx).also { repo = it }
@@ -124,20 +150,27 @@ class LxdlPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
         return http!!
     }
 
-    private fun engineOrCreate(): Engine {
-        engine?.let { return it }
+    /** 预览/测速/复制直链用的独立引擎，避免和下载任务抢同一个脚本上下文。 */
+    private fun interactiveEngine(): Engine = synchronized(engines) {
+        interactive ?: createEngine().also { interactive = it }
+    }
+
+    private fun engineAt(index: Int): Engine = synchronized(engines) {
+        while (engines.size <= index) engines.add(createEngine())
+        engines[index]
+    }
+
+    private fun createEngine(): Engine {
         val act = activity ?: throw IllegalStateException("界面未就绪")
         val (r, p) = base()
-        val w = WebView(act)
-        w.isFocusable = false
+        val web = WebView(act)
+        web.isFocusable = false
         val root = act.findViewById<ViewGroup>(android.R.id.content)
             ?: throw IllegalStateException("找不到根视图")
-        root.addView(w, ViewGroup.LayoutParams(1, 1))
-        web = w
-        val e = Engine(act, r, h(), w, p)
+        root.addView(web, ViewGroup.LayoutParams(1, 1))
+        val e = Engine(act, r, h(), web, p)
         e.onLog = { sendEvent("log", it) }
         e.start()
-        engine = e
         return e
     }
 
@@ -149,6 +182,7 @@ class LxdlPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
                 o.put("key", data.getOrNull(0))
                 o.put("value", data.getOrNull(1))
             }
+            "share" -> o.put("text", data.getOrNull(0)?.toString() ?: "")
         }
         main.post { runCatching { channel.invokeMethod("event", o.toString()) } }
     }
@@ -166,6 +200,11 @@ class LxdlPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
     override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
         when (call.method) {
             "ping" -> reply(result, true)
+            "takeShare" -> {
+                val t = pendingShare
+                pendingShare = null
+                reply(result, t)
+            }
             "config" -> reply(result, runCatching { base().first.cfg.toJson().toString() }
                 .getOrElse { fail(result, it); return })
             "setConfig" -> {
@@ -178,14 +217,15 @@ class LxdlPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
                 r.cfg.naming = o.optString("naming", r.cfg.naming)
                 r.cfg.outDir = o.optString("outDir", r.cfg.outDir)
                 r.cfg.lyrics = o.optBoolean("lyrics", r.cfg.lyrics)
+                r.cfg.lrcSidecar = o.optBoolean("lrcSidecar", r.cfg.lrcSidecar)
+                r.cfg.concurrency = o.optInt("concurrency", r.cfg.concurrency).coerceIn(1, 3)
+                r.cfg.wifiOnly = o.optBoolean("wifiOnly", r.cfg.wifiOnly)
+                r.cfg.outTree = o.optString("outTree", r.cfg.outTree)
                 r.saveCfg()
                 h().setProxy(r.cfg.proxy)
                 reply(result, true)
             }
-            "sources" -> {
-                base()
-                reply(result, sourcesJson().toString())
-            }
+            "sources" -> { base(); reply(result, sourcesJson().toString()) }
             "importSource" -> {
                 val text = call.argument<String>("text") ?: ""
                 scope.launch {
@@ -206,6 +246,28 @@ class LxdlPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
                 )
                 reply(result, sourcesJson().toString())
             }
+            "probeSources" -> scope.launch {
+                val list = JSONArray()
+                runCatching { base() }.getOrElse { fail(result, it); return@launch }
+                repo!!.listSources().forEach { entry ->
+                    val start = System.currentTimeMillis()
+                    val o = JSONObject().put("name", entry.name)
+                    runCatching { interactiveEngine().loadScript(entry) }
+                        .onSuccess { infos ->
+                            o.put("ok", true)
+                            o.put("ms", System.currentTimeMillis() - start)
+                            o.put("platforms", JSONArray(infos.map { it.key }))
+                        }
+                        .onFailure { e ->
+                            o.put("ok", false)
+                            o.put("ms", System.currentTimeMillis() - start)
+                            o.put("platforms", JSONArray())
+                            o.put("error", e.message ?: "")
+                        }
+                    list.put(o)
+                }
+                reply(result, list.toString())
+            }
             "search" -> scope.launch {
                 runCatching {
                     base().second.search(
@@ -213,8 +275,10 @@ class LxdlPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
                         call.argument<String>("keyword") ?: "",
                         call.argument<Boolean>("playlist") ?: false
                     )
-                }.onSuccess { reply(result, tracksJson(it).toString()) }
-                    .onFailure { fail(result, it) }
+                }.onSuccess {
+                    repo?.rememberHistory(call.argument<String>("keyword") ?: "")
+                    reply(result, tracksJson(it).toString())
+                }.onFailure { fail(result, it) }
             }
             "parse" -> scope.launch {
                 runCatching {
@@ -222,6 +286,7 @@ class LxdlPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
                     val platform = call.argument<String>("platform") ?: "wy"
                     val text = call.argument<String>("text") ?: ""
                     val t = p.parse(platform, text)
+                    repo?.rememberHistory(text)
                     if (t.isPlaylist) p.playlistMeta(platform, t.id)
                     else runCatching { p.detail(platform, t.id) }
                         .getOrElse { Track(platform, t.id, t.id) }
@@ -237,110 +302,343 @@ class LxdlPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
                 }.onSuccess { reply(result, it.toJson().toString()) }
                     .onFailure { fail(result, it) }
             }
+            "playlistTracks" -> scope.launch {
+                runCatching {
+                    base().second.playlistTracks(
+                        call.argument<String>("platform") ?: "wy",
+                        call.argument<String>("id") ?: ""
+                    )
+                }.onSuccess { reply(result, tracksJson(it).toString()) }
+                    .onFailure { fail(result, it) }
+            }
             "downloads" -> reply(result, downloadsJson().toString())
             "startDownload" -> {
                 val raw = call.argument<String>("track") ?: "{}"
                 val t = runCatching { Track.from(JSONObject(raw)) }
                     .getOrElse { fail(result, it); return }
-                val r = base().first
-                r.cfg.quality = call.argument<String>("quality") ?: r.cfg.quality
-                r.cfg.naming = call.argument<String>("naming") ?: r.cfg.naming
-                r.cfg.outDir = call.argument<String>("outDir") ?: r.cfg.outDir
-                r.cfg.lyrics = call.argument<Boolean>("lyrics") ?: r.cfg.lyrics
-                r.saveCfg()
-                startDownload(t)
+                applyRunOptions(call)
+                startDownload(listOf(t))
+                reply(result, true)
+            }
+            "startTracks" -> {
+                val raw = call.argument<String>("tracks") ?: "[]"
+                val list = runCatching {
+                    val arr = JSONArray(raw)
+                    (0 until arr.length()).mapNotNull {
+                        arr.optJSONObject(it)?.let { o -> Track.from(o) }
+                    }
+                }.getOrElse { fail(result, it); return }
+                applyRunOptions(call)
+                startDownload(list)
+                reply(result, true)
+            }
+            "deleteDownload" -> {
+                base().first.removeItem(call.argument<Int>("key") ?: -1)
+                reply(result, downloadsJson().toString())
+            }
+            "pauseDownload" -> {
+                val key = call.argument<Int>("key") ?: -1
+                controls[key]?.paused = true
+                base().first.setStatus(key, "paused")
+                reply(result, true)
+            }
+            "resumeDownload" -> {
+                val key = call.argument<Int>("key") ?: -1
+                controls[key]?.paused = false
+                base().first.setStatus(key, "downloading")
+                reply(result, true)
+            }
+            "cancelDownload" -> {
+                val key = call.argument<Int>("key") ?: -1
+                controls[key]?.let {
+                    it.cancelled = true
+                    it.paused = false
+                    runCatching { it.call?.cancel() }
+                }
+                base().first.fail(key, "已取消")
+                reply(result, true)
+            }
+            "resolveUrl" -> {
+                val raw = call.argument<String>("track") ?: "{}"
+                val quality = call.argument<String>("quality") ?: "320k"
+                scope.launch {
+                    runCatching {
+                        val t = Track.from(JSONObject(raw))
+                        interactiveEngine().resolveUrl(t, quality)
+                    }.onSuccess { reply(result, it) }
+                        .onFailure { fail(result, it) }
+                }
+            }
+            "pickOutDir" -> pickOutDir(result)
+            "openFile" -> {
+                val uri = call.argument<String>("uri") ?: ""
+                val path = call.argument<String>("path") ?: ""
+                reply(result, openFile(uri, path))
+            }
+            "shareFile" -> {
+                val uri = call.argument<String>("uri") ?: ""
+                reply(result, shareFile(uri))
+            }
+            "retag" -> {
+                val key = call.argument<Int>("key") ?: -1
+                scope.launch {
+                    runCatching {
+                        retag(
+                            key,
+                            call.argument<String>("title") ?: "",
+                            call.argument<String>("artist") ?: "",
+                            call.argument<String>("album") ?: ""
+                        )
+                    }.onSuccess { reply(result, it) }
+                        .onFailure { fail(result, it) }
+                }
+            }
+            "playPreview" -> {
+                val url = call.argument<String>("url") ?: ""
+                reply(result, playPreview(url))
+            }
+            "stopPreview" -> {
+                stopPreview()
                 reply(result, true)
             }
             else -> result.notImplemented()
         }
     }
 
-    // ---------------- 系统文件选择器 ----------------
+    private fun applyRunOptions(call: MethodCall) {
+        val r = base().first
+        r.cfg.quality = call.argument<String>("quality") ?: r.cfg.quality
+        r.cfg.naming = call.argument<String>("naming") ?: r.cfg.naming
+        r.cfg.outDir = call.argument<String>("outDir") ?: r.cfg.outDir
+        r.cfg.lyrics = call.argument<Boolean>("lyrics") ?: r.cfg.lyrics
+        r.saveCfg()
+    }
+
+    // ---------------- 选择器 ----------------
 
     private fun pickSource(result: MethodChannel.Result) {
         val act = activity
-        if (act == null) {
-            fail(result, IllegalStateException("界面未就绪"))
-            return
-        }
-        if (pendingPick != null) {
-            fail(result, IllegalStateException("正在选择文件"))
-            return
-        }
+        if (act == null) { fail(result, IllegalStateException("界面未就绪")); return }
+        if (pendingPick != null) { fail(result, IllegalStateException("正在选择文件")); return }
         pendingPick = result
         val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
             type = "*/*"
-            putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("application/javascript", "text/javascript", "text/plain", "*/*"))
+            putExtra(
+                Intent.EXTRA_MIME_TYPES,
+                arrayOf("application/javascript", "text/javascript", "text/plain")
+            )
         }
         runCatching { act.startActivityForResult(intent, PICK_REQUEST) }
-            .onFailure {
-                pendingPick = null
-                fail(result, it)
-            }
+            .onFailure { pendingPick = null; fail(result, it) }
+    }
+
+    private fun pickOutDir(result: MethodChannel.Result) {
+        val act = activity
+        if (act == null) { fail(result, IllegalStateException("界面未就绪")); return }
+        if (pendingDir != null) { fail(result, IllegalStateException("正在选择目录")); return }
+        pendingDir = result
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+            addFlags(
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                    Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+                    Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+            )
+        }
+        runCatching { act.startActivityForResult(intent, DIR_REQUEST) }
+            .onFailure { pendingDir = null; fail(result, it) }
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?): Boolean {
-        if (requestCode != PICK_REQUEST) return false
-        val result = pendingPick ?: return true
-        pendingPick = null
-        val uri = data?.data
-        if (resultCode != Activity.RESULT_OK || uri == null) {
-            fail(result, IllegalStateException("没有选择文件"))
-            return true
+        when (requestCode) {
+            PICK_REQUEST -> {
+                val result = pendingPick ?: return true
+                pendingPick = null
+                val uri = data?.data
+                if (resultCode != Activity.RESULT_OK || uri == null) {
+                    fail(result, IllegalStateException("没有选择文件")); return true
+                }
+                scope.launch {
+                    runCatching {
+                        val text = appCtx.contentResolver.openInputStream(uri)?.use {
+                            it.bufferedReader().readText()
+                        } ?: throw IllegalStateException("读不到文件")
+                        base().first.importSource(text, h())
+                    }.onSuccess { reply(result, sourcesJson().toString()) }
+                        .onFailure { fail(result, it) }
+                }
+                return true
+            }
+            DIR_REQUEST -> {
+                val result = pendingDir ?: return true
+                pendingDir = null
+                val uri = data?.data
+                if (resultCode != Activity.RESULT_OK || uri == null) {
+                    fail(result, IllegalStateException("没有选择目录")); return true
+                }
+                runCatching {
+                    appCtx.contentResolver.takePersistableUriPermission(
+                        uri,
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                    )
+                }
+                base().first.cfg.outTree = uri.toString()
+                base().first.saveCfg()
+                reply(result, uri.toString())
+                return true
+            }
         }
-        scope.launch {
-            runCatching {
-                val text = appCtx.contentResolver.openInputStream(uri)?.use { input ->
-                    input.bufferedReader().readText()
-                } ?: throw IllegalStateException("读不到文件")
-                base().first.importSource(text, h())
-            }.onSuccess { reply(result, sourcesJson().toString()) }
-                .onFailure { fail(result, it) }
-        }
-        return true
+        return false
     }
 
     // ---------------- 下载 ----------------
 
-    private fun startDownload(t: Track) {
-        scope.launch {
-            val (r, p) = base()
-            val songs = runCatching {
-                if (t.isPlaylist) p.playlistTracks(t.platform, t.id) else listOf(t)
-            }.getOrElse { e ->
-                sendEvent("log", "展开歌单失败：${e.message}")
-                return@launch
-            }
-            val e = runCatching { engineOrCreate() }.getOrElse { ex ->
-                sendEvent("log", "引擎初始化失败：${ex.message}")
-                return@launch
-            }
-            sendEvent("log", "开始下载 ${songs.size} 首")
-            for ((idx, song) in songs.withIndex()) {
-                val item = r.addItem(song)
-                sendEvent("downloads")
-                val label = "[${idx + 1}/${songs.size}]"
-                runCatching {
-                    e.downloadSong(
-                        song,
-                        onProgress = { pr, done, total ->
-                            r.progress(item.key, done, total)
-                            sendEvent("progress", item.key, pr)
-                        },
-                        onStatus = { s -> sendEvent("log", "$label $s") }
-                    )
-                }.onSuccess {
-                    r.finish(item.key, it)
-                    sendEvent("log", "$label 完成：$it")
-                }.onFailure {
-                    r.fail(item.key, it.message ?: "失败")
-                    sendEvent("log", "$label 失败：${it.message}")
-                }
-                sendEvent("downloads")
-            }
-            sendEvent("log", "全部结束")
+    private fun startDownload(tracks: List<Track>) {
+        val r = base().first
+        if (tracks.isEmpty()) return
+        if (r.cfg.wifiOnly && !isWifi()) {
+            sendEvent("log", "当前不是 Wi-Fi，已跳过（可关闭「仅 Wi-Fi」）")
+            return
         }
+        val n = r.cfg.concurrency.coerceIn(1, 3)
+        val sem = Semaphore(n)
+        tracks.forEachIndexed { index, t ->
+            scope.launch {
+                sem.withPermit { downloadOne(t, index % n) }
+            }
+        }
+    }
+
+    private fun isWifi(): Boolean = runCatching {
+        val cm = appCtx.getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
+        val caps = cm.activeNetwork?.let { cm.getNetworkCapabilities(it) }
+        caps?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) == true
+    }.getOrDefault(true)
+
+    private fun downloadOne(t: Track, worker: Int) {
+        val (r, _) = base()
+        val item = r.addItem(t)
+        val control = DownloadControl()
+        controls[item.key] = control
+        sendEvent("downloads")
+        runCatching { Notifier.start(appCtx, t.title) }
+        var lastNotify = 0L
+        try {
+            val engine = engineAt(worker)
+            val out = engine.downloadSong(
+                t, item.key, control,
+                onProgress = { pr, done, total ->
+                    r.progress(item.key, done, total)
+                    sendEvent("progress", item.key, pr)
+                    val now = System.currentTimeMillis()
+                    if (now - lastNotify > 1200) {
+                        lastNotify = now
+                        Notifier.update(appCtx, t.title, done, total ?: 0)
+                    }
+                },
+                onStatus = { s -> sendEvent("log", s) }
+            )
+            r.finish(item.key, out.display, out.uri)
+            Notifier.done(appCtx, t.title, out.uri, out.display)
+            sendEvent("log", "完成：${out.display}")
+        } catch (e: Cancelled) {
+            r.fail(item.key, "已取消")
+        } catch (e: Exception) {
+            r.fail(item.key, e.message ?: "失败")
+            sendEvent("log", "失败：${e.message}")
+        } finally {
+            controls.remove(item.key)
+            sendEvent("downloads")
+            if (controls.isEmpty()) Notifier.stop(appCtx)
+        }
+    }
+
+    // ---------------- 播放 / 文件 ----------------
+
+    private fun playPreview(url: String): Boolean {
+        val act = activity ?: return false
+        return runCatching {
+            main.post {
+                runCatching {
+                    player?.release()
+                    player = MediaPlayer().apply {
+                        setDataSource(url)
+                        setOnPreparedListener { it.start() }
+                        prepareAsync()
+                    }
+                }
+            }
+            true
+        }.getOrDefault(false)
+    }
+
+    private fun stopPreview() {
+        main.post {
+            runCatching { player?.release() }
+            player = null
+        }
+    }
+
+    private fun openFile(uri: String, path: String): Boolean {
+        val act = activity ?: return false
+        if (uri.isBlank()) return false
+        return runCatching {
+            val intent = if (uri.isNotBlank()) {
+                Intent(Intent.ACTION_VIEW).setDataAndType(Uri.parse(uri), "audio/*")
+                    .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            } else {
+                Intent(Intent.ACTION_VIEW).setDataAndType(Uri.fromFile(File(path)), "audio/*")
+                    .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            act.startActivity(intent)
+            true
+        }.getOrDefault(false)
+    }
+
+    private fun shareFile(uri: String): Boolean {
+        val act = activity ?: return false
+        if (uri.isBlank()) return false
+        return runCatching {
+            act.startActivity(
+                Intent.createChooser(
+                    Intent(Intent.ACTION_SEND).apply {
+                        type = "audio/*"
+                        putExtra(Intent.EXTRA_STREAM, Uri.parse(uri))
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    }, "分享"
+                )
+            )
+            true
+        }.getOrDefault(false)
+    }
+
+    private fun retag(key: Int, title: String, artist: String, album: String): Boolean {
+        val r = base().first
+        val item = r.item(key) ?: return false
+        val tmp = File(r.cacheDir, "retag-$key")
+        if (item.uri.isNotBlank()) {
+            appCtx.contentResolver.openInputStream(Uri.parse(item.uri))?.use { input ->
+                tmp.outputStream().use { input.copyTo(it) }
+            } ?: return false
+        } else {
+            File(item.path).takeIf { it.isFile }?.copyTo(tmp, overwrite = true) ?: return false
+        }
+        val err = Tagger.retag(tmp, title, artist, album)
+        if (err != null) {
+            tmp.delete()
+            throw IllegalStateException(err)
+        }
+        if (item.uri.isNotBlank()) {
+            appCtx.contentResolver.openOutputStream(Uri.parse(item.uri), "wt")?.use { out ->
+                tmp.inputStream().use { it.copyTo(out) }
+            } ?: throw IllegalStateException("写不回文件")
+        } else {
+            tmp.copyTo(File(item.path), overwrite = true)
+        }
+        tmp.delete()
+        r.updateMeta(key, title, artist, album)
+        sendEvent("downloads")
+        return true
     }
 
     // ---------------- JSON ----------------
@@ -370,5 +668,6 @@ class LxdlPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
 
     companion object {
         private const val PICK_REQUEST = 0x4C58
+        private const val DIR_REQUEST = 0x4C59
     }
 }

@@ -73,6 +73,11 @@ class Engine(
         }
     }
 
+    fun detach() {
+        runCatching { (web.parent as? android.view.ViewGroup)?.removeView(web) }
+        runCatching { web.destroy() }
+    }
+
     private fun log(text: String) {
         onLog?.invoke(text)
     }
@@ -244,13 +249,31 @@ class Engine(
         }
     }
 
+    // ---------------- 取链（只解析不下载） ----------------
+
+    suspend fun resolveUrl(item: Track, quality: String): String = withContext(Dispatchers.IO) {
+        for (entry in repo.listSources().take(3)) {
+            val infos = runCatching { loadScript(entry) }.getOrNull() ?: continue
+            val si = infos.firstOrNull { it.key == item.platform } ?: continue
+            val chain = if (si.qualities.contains(quality)) listOf(quality) else qualityChain(si)
+            for (q in chain) {
+                val info = JSONObject().put("type", q).put("musicInfo", musicInfo(item))
+                val v = runCatching { call(item.platform, "musicUrl", info) }.getOrNull() ?: continue
+                extractUrl(v)?.let { return@withContext it }
+            }
+        }
+        throw IllegalStateException("音源不可用：没拿到链接")
+    }
+
     // ---------------- 下载 ----------------
 
     suspend fun downloadSong(
         item: Track,
+        key: Int,
+        control: DownloadControl,
         onProgress: (Double, Long, Long?) -> Unit,
         onStatus: (String) -> Unit
-    ): String = withContext(Dispatchers.IO) {
+    ): Exporter.Out = withContext(Dispatchers.IO) {
         val meta = mergeMeta(item)
         onStatus("取链中…")
 
@@ -261,6 +284,7 @@ class Engine(
         val candidates = mutableListOf<Candidate>()
         var unofficial = false
         for (entry in entries) {
+            if (control.cancelled) throw Cancelled()
             val infos = runCatching { loadScript(entry) }.getOrNull()
             if (infos == null) {
                 log("音源 ${entry.name} 加载失败")
@@ -294,20 +318,26 @@ class Engine(
         for (c in candidates) {
             if (attempts >= 3) break
             attempts++
+            if (control.cancelled) throw Cancelled()
             onStatus("下载 ${c.quality}…")
-            val tmp = File(repo.cacheDir, "cand-${System.currentTimeMillis()}-$attempts.bin")
-            val ok = runCatching {
-                http.download(c.url, tmp) { done, total -> onProgress(
-                    if (total != null && total > 0) (done.toDouble() / total).coerceIn(0.0, 1.0) else 0.0,
-                    done, total
-                ) }
+            val tmp = File(repo.cacheDir, "cand-$key-$attempts.bin")
+            val ok = try {
+                http.download(c.url, tmp, control) { done, total ->
+                    onProgress(
+                        if (total != null && total > 0) (done.toDouble() / total).coerceIn(0.0, 1.0) else 0.0,
+                        done, total
+                    )
+                }
                 tmp
-            }.getOrNull()
-            if (ok == null) {
-                log("该渠道下载失败")
+            } catch (e: Cancelled) {
                 tmp.delete()
-                continue
+                throw e
+            } catch (e: Exception) {
+                log("该渠道下载失败：${e.message}")
+                tmp.delete()
+                null
             }
+            if (ok == null) continue
             val dur = durationOf(ok)
             log("渠道时长 ${dur}s")
             val better = best == null || dur > best!!.third
@@ -326,8 +356,7 @@ class Engine(
         }
 
         val ext = sniffExt(picked.second)
-        // jaudiotagger 按扩展名选解析器，先改成正确后缀再写标签
-        val tagged = File(repo.cacheDir, "tagged-${System.currentTimeMillis()}.$ext")
+        val tagged = File(repo.cacheDir, "tagged-$key.$ext")
         if (!picked.second.renameTo(tagged)) {
             picked.second.copyTo(tagged, overwrite = true)
             picked.second.delete()
@@ -341,9 +370,17 @@ class Engine(
 
         val name = buildName(meta, ext)
         onStatus("导出…")
-        val shown = Exporter.export(ctx, tagged, repo.cfg.outDir, name, Exporter.mimeFor(ext))
+        val out = Exporter.export(ctx, tagged, repo.cfg.outDir, name, Exporter.mimeFor(ext), repo.cfg.outTree)
         tagged.delete()
-        shown
+
+        if (repo.cfg.lrcSidecar && !lyrics.isNullOrBlank()) {
+            val lrc = File(repo.cacheDir, "lyric-$key.lrc")
+            lrc.writeText(lyrics)
+            val lrcName = name.substringBeforeLast('.') + ".lrc"
+            runCatching { Exporter.export(ctx, lrc, repo.cfg.outDir, lrcName, "text/plain", repo.cfg.outTree) }
+            lrc.delete()
+        }
+        out
     }
 
     private fun mergeMeta(item: Track): Track {

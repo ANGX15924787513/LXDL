@@ -7,12 +7,22 @@ import okhttp3.RequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import java.io.File
+import java.io.IOException
 import java.net.InetSocketAddress
 import java.net.Proxy
 import java.util.concurrent.TimeUnit
 
 private const val UA =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+
+/** 单个下载任务的暂停/取消控制。 */
+class DownloadControl {
+    @Volatile var paused = false
+    @Volatile var cancelled = false
+    @Volatile var call: okhttp3.Call? = null
+}
+
+class Cancelled : IOException("已取消")
 
 class Http {
     @Volatile private var _proxy: String = ""
@@ -87,39 +97,74 @@ class Http {
         }
     }
 
-    fun download(url: String, dest: File, onProgress: (Long, Long?) -> Unit): String {
-        val req = Request.Builder().url(url).header("User-Agent", UA).build()
+    /**
+     * 支持断点续传（.part）与暂停/取消的下载。
+     */
+    fun download(
+        url: String,
+        dest: File,
+        control: DownloadControl,
+        onProgress: (Long, Long?) -> Unit
+    ): String {
+        dest.parentFile?.mkdirs()
+        val part = File(dest.absolutePath + ".part")
+        var existing = if (part.isFile) part.length() else 0L
+        val builder = Request.Builder().url(url).header("User-Agent", UA)
+        if (existing > 0) builder.header("Range", "bytes=$existing-")
         val call = _client.newBuilder()
             .callTimeout(0, TimeUnit.MILLISECONDS)
             .readTimeout(60, TimeUnit.SECONDS)
             .build()
-            .newCall(req)
-        call.execute().use { r ->
-            if (!r.isSuccessful) throw IllegalStateException("HTTP ${r.code}")
-            val body = r.body ?: throw IllegalStateException("empty body")
-            val total = body.contentLength().takeIf { it > 0 }
-            val ctype = r.header("Content-Type") ?: ""
-            dest.parentFile?.mkdirs()
-            body.byteStream().use { input ->
-                dest.outputStream().use { out ->
-                    val buf = ByteArray(64 * 1024)
-                    var done = 0L
-                    var last = 0L
-                    while (true) {
-                        val n = input.read(buf)
-                        if (n <= 0) break
-                        out.write(buf, 0, n)
-                        done += n
-                        val now = System.currentTimeMillis()
-                        if (now - last > 200) {
-                            last = now
-                            onProgress(done, total)
-                        }
-                    }
-                    onProgress(done, total)
+            .newCall(builder.build())
+        control.call = call
+        try {
+            call.execute().use { r ->
+                if (!r.isSuccessful && r.code != 206) throw IllegalStateException("HTTP ${r.code}")
+                if (r.code == 200 && existing > 0) {
+                    // 服务器不支持 Range，重头来
+                    existing = 0
+                    part.delete()
                 }
+                val body = r.body ?: throw IllegalStateException("empty body")
+                val total = if (existing > 0) {
+                    r.header("Content-Range")?.substringAfter('/')?.toLongOrNull()
+                } else {
+                    body.contentLength().takeIf { it > 0 }
+                }
+                val ctype = r.header("Content-Type") ?: ""
+                val append = existing > 0
+                part.outputStream(append = append).use { out ->
+                    body.byteStream().use { input ->
+                        val buf = ByteArray(64 * 1024)
+                        var done = existing
+                        var last = 0L
+                        while (true) {
+                            if (control.cancelled) throw Cancelled()
+                            if (control.paused) {
+                                Thread.sleep(200)
+                                continue
+                            }
+                            val n = input.read(buf)
+                            if (n <= 0) break
+                            out.write(buf, 0, n)
+                            done += n
+                            val now = System.currentTimeMillis()
+                            if (now - last > 200) {
+                                last = now
+                                onProgress(done, total)
+                            }
+                        }
+                        onProgress(done, total)
+                    }
+                }
+                if (!part.renameTo(dest)) {
+                    part.copyTo(dest, overwrite = true)
+                    part.delete()
+                }
+                return ctype
             }
-            return ctype
+        } finally {
+            control.call = null
         }
     }
 }

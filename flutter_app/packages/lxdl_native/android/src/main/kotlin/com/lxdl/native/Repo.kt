@@ -14,7 +14,12 @@ data class Cfg(
     var quality: String = "320k",
     var naming: String = "{title} - {artist}",
     var outDir: String = "lxdl",
-    var lyrics: Boolean = true
+    var lyrics: Boolean = true,
+    var lrcSidecar: Boolean = false,
+    var concurrency: Int = 1,
+    var wifiOnly: Boolean = false,
+    var outTree: String = "",
+    var history: MutableList<String> = mutableListOf()
 ) {
     fun toJson(): JSONObject = JSONObject()
         .put("mirror", mirror)
@@ -24,21 +29,34 @@ data class Cfg(
         .put("naming", naming)
         .put("outDir", outDir)
         .put("lyrics", lyrics)
+        .put("lrcSidecar", lrcSidecar)
+        .put("concurrency", concurrency)
+        .put("wifiOnly", wifiOnly)
+        .put("outTree", outTree)
+        .put("history", JSONArray(history))
 
     companion object {
         fun from(o: JSONObject?): Cfg {
             if (o == null) return Cfg()
-            val arr = o.optJSONArray("order") ?: JSONArray()
-            val order = mutableListOf<String>()
-            for (i in 0 until arr.length()) order.add(arr.optString(i))
+            fun list(key: String): MutableList<String> {
+                val arr = o.optJSONArray(key) ?: JSONArray()
+                val out = mutableListOf<String>()
+                for (i in 0 until arr.length()) out.add(arr.optString(i))
+                return out
+            }
             return Cfg(
                 mirror = o.optString("mirror", ""),
                 proxy = o.optString("proxy", ""),
-                order = order,
+                order = list("order"),
                 quality = o.optString("quality", "320k"),
                 naming = o.optString("naming", "{title} - {artist}"),
                 outDir = o.optString("outDir", "lxdl"),
-                lyrics = o.optBoolean("lyrics", true)
+                lyrics = o.optBoolean("lyrics", true),
+                lrcSidecar = o.optBoolean("lrcSidecar", false),
+                concurrency = o.optInt("concurrency", 1).coerceIn(1, 3),
+                wifiOnly = o.optBoolean("wifiOnly", true),
+                outTree = o.optString("outTree", ""),
+                history = list("history")
             )
         }
     }
@@ -54,6 +72,7 @@ data class Item(
     val artist: String,
     val album: String,
     var path: String = "",
+    var uri: String = "",
     var status: String = "downloading",
     var progress: Double = 0.0,
     var done: Long = 0,
@@ -68,6 +87,7 @@ data class Item(
         .put("artist", artist)
         .put("album", album)
         .put("path", path)
+        .put("uri", uri)
         .put("status", status)
         .put("progress", progress)
         .put("done", done)
@@ -96,6 +116,15 @@ class Repo(val ctx: Context) {
         cfgFile.writeText(cfg.toJson().toString())
     }
 
+    fun rememberHistory(keyword: String) {
+        val k = keyword.trim()
+        if (k.isEmpty()) return
+        cfg.history.remove(k)
+        cfg.history.add(0, k)
+        while (cfg.history.size > 20) cfg.history.removeAt(cfg.history.size - 1)
+        saveCfg()
+    }
+
     // ---------------- 音源 ----------------
 
     fun listSources(): List<SourceEntry> {
@@ -121,13 +150,14 @@ class Repo(val ctx: Context) {
         val name = Regex("@name\\s+(.+)").find(text)?.groupValues?.get(1)?.trim()
             ?: "source-" + System.currentTimeMillis()
         val safe = name.replace(Regex("[\\\\/:*?\"<>|]"), "_").take(48)
-        val file = File(sourcesDir, "$safe.js")
-        file.writeText(text)
+        File(sourcesDir, "$safe.js").writeText(text)
         if (!cfg.order.contains(name)) cfg.order.add(name)
         saveCfg()
-        return SourceEntry(name, file.name,
+        return SourceEntry(
+            name, "$safe.js",
             Regex("@version\\s+(.+)").find(text)?.groupValues?.get(1)?.trim() ?: "",
-            Regex("@author\\s+(.+)").find(text)?.groupValues?.get(1)?.trim() ?: "")
+            Regex("@author\\s+(.+)").find(text)?.groupValues?.get(1)?.trim() ?: ""
+        )
     }
 
     fun deleteSource(name: String) {
@@ -165,16 +195,17 @@ class Repo(val ctx: Context) {
                 artist = o.optString("artist"),
                 album = o.optString("album"),
                 path = o.optString("path"),
+                uri = o.optString("uri"),
                 status = o.optString("status"),
                 progress = o.optDouble("progress", 0.0),
                 done = o.optLong("done"),
                 total = o.optLong("total"),
                 error = o.optString("error").ifEmpty { null }
             )
-            if (it.status == "downloading") {
+            if (it.status == "downloading" || it.status == "paused") {
                 it.status = "failed"
                 it.error = "上次退出时未完成"
-            } else if (it.status == "done" && !exists(it.path)) {
+            } else if (it.status == "done" && !exists(it)) {
                 it.status = "deleted"
             }
             items.add(it)
@@ -196,6 +227,8 @@ class Repo(val ctx: Context) {
         it
     }
 
+    fun item(key: Int): Item? = synchronized(lock) { items.firstOrNull { it.key == key } }
+
     fun progress(key: Int, done: Long, total: Long?) = synchronized(lock) {
         items.firstOrNull { it.key == key }?.let {
             it.done = done
@@ -206,9 +239,15 @@ class Repo(val ctx: Context) {
         }
     }
 
-    fun finish(key: Int, path: String) = synchronized(lock) {
+    fun setStatus(key: Int, status: String) = synchronized(lock) {
+        items.firstOrNull { it.key == key }?.status = status
+        persist()
+    }
+
+    fun finish(key: Int, path: String, uri: String) = synchronized(lock) {
         items.firstOrNull { it.key == key }?.let {
             it.path = path
+            it.uri = uri
             it.status = "done"
             it.progress = 1.0
             it.done = maxOf(it.done, it.total)
@@ -225,11 +264,30 @@ class Repo(val ctx: Context) {
         persist()
     }
 
-    /** 完成的文件是否还在：绝对路径查文件，MediaStore 相对路径查内容库。 */
-    private fun exists(path: String): Boolean {
+    fun updateMeta(key: Int, title: String, artist: String, album: String) = synchronized(lock) {
+        items.firstOrNull { it.key == key }?.let {
+            it.title = title
+            it.artist = artist
+            it.album = album
+        }
+        persist()
+    }
+
+    fun removeItem(key: Int) = synchronized(lock) {
+        items.removeAll { it.key == key }
+        persist()
+    }
+
+    private fun exists(item: Item): Boolean {
+        if (item.uri.isNotBlank()) {
+            return runCatching {
+                ctx.contentResolver.openInputStream(android.net.Uri.parse(item.uri))?.close()
+                true
+            }.getOrDefault(false)
+        }
+        val path = item.path
         if (path.isBlank()) return false
         if (path.startsWith("/")) return File(path).isFile
-        // MediaStore.Downloads 只有 API 29+ 有
         if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.Q) return false
         val name = path.substringAfterLast('/')
         return runCatching {
@@ -242,9 +300,13 @@ class Repo(val ctx: Context) {
         }.getOrDefault(false)
     }
 
+    /** 已完成的文件是否还在（绝对路径 / MediaStore / SAF 树）。 */
+    fun exists(path: String, uri: String): Boolean =
+        exists(Item(0, "", "", "", "", "", path = path, uri = uri))
+
     fun listDownloads(): List<Item> = synchronized(lock) {
         items.forEach {
-            if (it.status == "done" && !exists(it.path)) it.status = "deleted"
+            if (it.status == "done" && !exists(it)) it.status = "deleted"
         }
         items.toList()
     }
