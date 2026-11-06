@@ -2,8 +2,24 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import '../bridge.dart';
 
+const _themePresets = <(String, String)>[
+  ('蓝', '#3A7AF0'),
+  ('青', '#00BFA6'),
+  ('绿', '#43A047'),
+  ('橙', '#FF8F00'),
+  ('红', '#E53935'),
+  ('粉', '#EC407A'),
+  ('紫', '#8E24AA'),
+  ('灰', '#546E7A'),
+];
+
+const _defaultThemeHex = '#3A7AF0';
+
 class SourcesPage extends StatefulWidget {
-  const SourcesPage({super.key});
+  const SourcesPage({super.key, required this.themeSeed});
+
+  /// 改主题色时立刻生效，同时写回原生配置
+  final ValueNotifier<Color> themeSeed;
 
   @override
   State<SourcesPage> createState() => _SourcesPageState();
@@ -21,6 +37,7 @@ class _SourcesPageState extends State<SourcesPage> {
   bool _wifiOnly = true;
   bool _lrcSidecar = false;
   String _outTree = '';
+  String _theme = _defaultThemeHex;
 
   @override
   void initState() {
@@ -41,6 +58,8 @@ class _SourcesPageState extends State<SourcesPage> {
         _wifiOnly = cfg['wifiOnly'] as bool? ?? true;
         _lrcSidecar = cfg['lrcSidecar'] as bool? ?? false;
         _outTree = cfg['outTree'] as String? ?? '';
+        final t = (cfg['theme'] as String?)?.trim() ?? '';
+        if (t.isNotEmpty) _theme = t.toUpperCase();
       });
     } catch (_) {}
   }
@@ -149,6 +168,18 @@ class _SourcesPageState extends State<SourcesPage> {
     }
   }
 
+  Color _colorOf(String hex) {
+    final v = int.tryParse(hex.replaceFirst('#', ''), radix: 16) ?? 0x3A7AF0;
+    return Color(0xFF000000 | v);
+  }
+
+  void _setTheme(String hex) {
+    final h = hex.toUpperCase();
+    setState(() => _theme = h);
+    widget.themeSeed.value = _colorOf(h);
+    _save({'theme': h});
+  }
+
   Future<void> _saveNet() async {
     await _save({'mirror': _mirror.text.trim(), 'proxy': _proxy.text.trim()});
   }
@@ -229,11 +260,7 @@ class _SourcesPageState extends State<SourcesPage> {
             Expanded(
               child: TextField(
                 controller: _mirror,
-                decoration: const InputDecoration(
-                  isDense: true,
-                  hintText: '可选，API 反代地址',
-                  border: OutlineInputBorder(),
-                ),
+                decoration: const InputDecoration(hintText: '可选，API 反代地址'),
               ),
             ),
           ]),
@@ -244,11 +271,7 @@ class _SourcesPageState extends State<SourcesPage> {
             Expanded(
               child: TextField(
                 controller: _proxy,
-                decoration: const InputDecoration(
-                  isDense: true,
-                  hintText: '可选，127.0.0.1:7890',
-                  border: OutlineInputBorder(),
-                ),
+                decoration: const InputDecoration(hintText: '可选，127.0.0.1:7890'),
               ),
             ),
             const SizedBox(width: 6),
@@ -299,6 +322,41 @@ class _SourcesPageState extends State<SourcesPage> {
               label: Text(_outTree.isEmpty ? '导出目录：默认' : '导出目录：已选'),
             ),
           ]),
+          const SizedBox(height: 4),
+          Row(children: [
+            const Text('主题色'),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Wrap(
+                spacing: 8,
+                runSpacing: 6,
+                children: [
+                  for (final (name, hex) in _themePresets)
+                    Tooltip(
+                      message: name,
+                      child: InkWell(
+                        onTap: () => _setTheme(hex),
+                        customBorder: const CircleBorder(),
+                        child: Container(
+                          width: 24,
+                          height: 24,
+                          decoration: BoxDecoration(
+                            color: _colorOf(hex),
+                            shape: BoxShape.circle,
+                            border: _theme == hex.toUpperCase()
+                                ? Border.all(
+                                    color: Theme.of(context).colorScheme.onSurface,
+                                    width: 2,
+                                  )
+                                : null,
+                          ),
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          ]),
         ]),
       ),
     );
@@ -325,11 +383,21 @@ class _SourcesPageState extends State<SourcesPage> {
         child: Transform.translate(offset: Offset(0, (1 - value) * 8), child: child),
       ),
       child: Container(
-        margin: const EdgeInsets.only(bottom: 6),
-        decoration: BoxDecoration(color: Theme.of(context).cardColor, borderRadius: BorderRadius.circular(10)),
+        margin: const EdgeInsets.only(bottom: 8),
+        decoration: BoxDecoration(
+          color: Theme.of(context).colorScheme.surfaceContainerLow.withValues(alpha: 0.85),
+          borderRadius: BorderRadius.circular(18),
+          border: Border.all(
+            color: Theme.of(context).colorScheme.outlineVariant.withValues(alpha: 0.35),
+          ),
+        ),
         child: ListTile(
           dense: true,
-          leading: Text('${i + 1}.', style: const TextStyle(color: Colors.black45)),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+          leading: Text(
+            '${i + 1}.',
+            style: TextStyle(color: Theme.of(context).colorScheme.onSurfaceVariant),
+          ),
           title: Text(name, maxLines: 1, overflow: TextOverflow.ellipsis),
           subtitle: hint.isEmpty ? null : Text(hint, maxLines: 1, overflow: TextOverflow.ellipsis),
           trailing: Row(mainAxisSize: MainAxisSize.min, children: [

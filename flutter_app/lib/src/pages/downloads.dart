@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import '../bridge.dart';
+import '../ui.dart';
 
 class DownloadsPage extends StatefulWidget {
   final ValueNotifier<int> tick;
@@ -221,7 +222,7 @@ class _DownloadsPageState extends State<DownloadsPage> {
                   physics: const AlwaysScrollableScrollPhysics(),
                   padding: const EdgeInsets.symmetric(horizontal: 12),
                   itemCount: shown.length,
-                  itemBuilder: (_, i) => _card(shown[i]),
+                  itemBuilder: (_, i) => StaggeredIn(index: i, child: _card(shown[i])),
                 ),
         ),
       ),
@@ -235,15 +236,14 @@ class _DownloadsPageState extends State<DownloadsPage> {
     final failed = status == 'failed';
     final deleted = status == 'deleted';
     final done = status == 'done';
-    final color = downloading
-        ? const Color(0xFFDCE9FB)
-        : paused
-            ? const Color(0xFFFFF3D6)
-            : done
-                ? const Color(0xFFDDF3E4)
-                : failed
-                    ? const Color(0xFFFBDCDC)
-                    : const Color(0xFFECEDEF);
+    final scheme = Theme.of(context).colorScheme;
+    final color = switch (status) {
+      'downloading' => scheme.primaryContainer.withValues(alpha: 0.62),
+      'paused' => scheme.tertiaryContainer.withValues(alpha: 0.58),
+      'done' => scheme.secondaryContainer.withValues(alpha: 0.62),
+      'failed' => scheme.errorContainer.withValues(alpha: 0.55),
+      _ => scheme.surfaceContainerHighest.withValues(alpha: 0.55),
+    };
     final title = it['title'] as String? ?? '';
     final artist = it['artist'] as String? ?? '';
     final path = it['path'] as String? ?? '';
@@ -271,7 +271,11 @@ class _DownloadsPageState extends State<DownloadsPage> {
         curve: Curves.easeOut,
         margin: const EdgeInsets.only(bottom: 8),
         padding: const EdgeInsets.fromLTRB(10, 8, 4, 8),
-        decoration: BoxDecoration(color: color, borderRadius: BorderRadius.circular(10)),
+        decoration: BoxDecoration(
+          color: color,
+          borderRadius: BorderRadius.circular(18),
+          border: Border.all(color: scheme.outlineVariant.withValues(alpha: 0.35)),
+        ),
         child: active
             ? Row(children: [
                 Expanded(
@@ -285,9 +289,13 @@ class _DownloadsPageState extends State<DownloadsPage> {
                     TweenAnimationBuilder<double>(
                       tween: Tween(begin: 0.0, end: progress.clamp(0.0, 1.0).toDouble()),
                       duration: const Duration(milliseconds: 300),
-                      builder: (_, value, __) => LinearProgressIndicator(
-                        value: value <= 0 ? null : value,
-                        minHeight: 5,
+                      builder: (_, value, __) => ClipRRect(
+                        borderRadius: BorderRadius.circular(4),
+                        child: LinearProgressIndicator(
+                          value: value <= 0 ? null : value,
+                          minHeight: 5,
+                          backgroundColor: scheme.surfaceContainerHighest,
+                        ),
                       ),
                     ),
                     const SizedBox(height: 4),
@@ -316,7 +324,10 @@ class _DownloadsPageState extends State<DownloadsPage> {
                 ),
                 Text(
                   statusText,
-                  style: TextStyle(fontSize: 11, color: failed || deleted ? Colors.red : Colors.green[800]),
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: failed || deleted ? scheme.error : scheme.onSurfaceVariant,
+                  ),
                 ),
                 IconButton(
                   tooltip: '更多',

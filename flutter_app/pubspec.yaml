@@ -12,7 +12,12 @@ dependencies:
 dev_dependencies:
   flutter_test:
     sdk: flutter
+  flutter_launcher_icons: "^0.14.4"
 flutter:
   uses-material-design: true
   assets:
     - assets/lx_host.html
+flutter_launcher_icons:
+  android: "launcher_icon" # Android端图标名称
+  ios: true                # 同时生成iOS图标
+  image_path: "icon.png"

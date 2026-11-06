@@ -227,6 +227,7 @@ class LxdlPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAware
                 r.cfg.quality = o.optString("quality", r.cfg.quality)
                 r.cfg.naming = o.optString("naming", r.cfg.naming)
                 r.cfg.outDir = o.optString("outDir", r.cfg.outDir)
+                r.cfg.theme = o.optString("theme", r.cfg.theme)
                 r.cfg.lyrics = o.optBoolean("lyrics", r.cfg.lyrics)
                 r.cfg.lrcSidecar = o.optBoolean("lrcSidecar", r.cfg.lrcSidecar)
                 r.cfg.concurrency = o.optInt("concurrency", r.cfg.concurrency).coerceIn(1, 3)
@@ -298,9 +299,10 @@ class LxdlPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAware
                     val text = call.argument<String>("text") ?: ""
                     val t = p.parse(platform, text)
                     repo?.rememberHistory(text)
-                    if (t.isPlaylist) p.playlistMeta(platform, t.id)
-                    else runCatching { p.detail(platform, t.id) }
-                        .getOrElse { Track(platform, t.id, t.id) }
+                    // 深链接可能自带平台（netease:// 这类），以解析结果为准
+                    if (t.isPlaylist) p.playlistMeta(t.platform, t.id)
+                    else runCatching { p.detail(t.platform, t.id) }
+                        .getOrElse { Track(t.platform, t.id, t.id) }
                 }.onSuccess { reply(result, it.toJson().toString()) }
                     .onFailure { fail(result, it) }
             }
@@ -401,6 +403,14 @@ class LxdlPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAware
                             call.argument<String>("album") ?: ""
                         )
                     }.onSuccess { reply(result, it) }
+                        .onFailure { fail(result, it) }
+                }
+            }
+            "cover" -> {
+                val url = call.argument<String>("url") ?: ""
+                scope.launch {
+                    runCatching { coverPath(url) }
+                        .onSuccess { reply(result, it) }
                         .onFailure { fail(result, it) }
                 }
             }
@@ -577,6 +587,28 @@ class LxdlPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAware
     }
 
     // ---------------- 播放 / 文件 ----------------
+
+    /** 界面要封面：先查磁盘缓存；没有就下缩略图，失败再退回原图。 */
+    private fun coverPath(url: String): String? {
+        if (url.isBlank()) return null
+        CoverCache.get(appCtx, url, "thumb")?.let { return it.absolutePath }
+        val headers = mapOf("User-Agent" to UA, "Referer" to "https://music.163.com/")
+        val thumb = thumbUrl(url)
+        val bytes = runCatching { h().bytes(thumb, headers, 20_000) }.getOrNull()
+            ?.takeIf { it.isNotEmpty() }
+            ?: runCatching { h().bytes(url, headers, 20_000) }.getOrNull()
+        if (bytes == null || bytes.isEmpty()) return null
+        // 统一存在原 URL 名下，标签写入那边也能命中
+        return CoverCache.put(appCtx, url, bytes, "thumb")?.absolutePath
+    }
+
+    /** 大图换成 CDN 的小图，界面显示够用还快很多。 */
+    private fun thumbUrl(url: String): String = when {
+        url.contains("music.126.net") -> url.substringBefore('?') + "?param=240y240"
+        url.contains("y.gtimg.cn") -> url.replace("R500x500", "R300x300")
+            .replace("R800x800", "R300x300")
+        else -> url
+    }
 
     /** 试听：带 Referer 交给 MediaPlayer，403/解码失败会真的报错而不是静默。 */
     private suspend fun playPreview(url: String, platform: String): Boolean =

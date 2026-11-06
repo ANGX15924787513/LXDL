@@ -10,6 +10,7 @@ import android.webkit.JavascriptInterface
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.async
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -38,6 +39,31 @@ data class SourceInfo(
 }
 
 private data class Candidate(val url: String, val quality: String, val source: String, val official: Boolean)
+
+private const val MAX_CANDIDATES = 3
+
+/** 试听/复制直链的短缓存：LX 也是取到链接后复用一段时间。 */
+internal object UrlCache {
+    private const val TTL_MS = 10 * 60 * 1000L
+    private class Entry(val url: String, val at: Long)
+    private val map = ConcurrentHashMap<String, Entry>()
+    private fun key(platform: String, id: String, quality: String) = "$platform|$id|$quality"
+
+    fun get(platform: String, id: String, quality: String): String? {
+        val k = key(platform, id, quality)
+        val e = map[k] ?: return null
+        if (System.currentTimeMillis() - e.at > TTL_MS) {
+            map.remove(k)
+            return null
+        }
+        return e.url
+    }
+
+    fun put(platform: String, id: String, quality: String, url: String) {
+        if (map.size > 300) map.clear()
+        map[key(platform, id, quality)] = Entry(url, System.currentTimeMillis())
+    }
+}
 
 class Engine(
     private val ctx: Context,
@@ -124,9 +150,10 @@ class Engine(
             "try{\n" + code + "\n}catch(e){lxHost.log('error', String(e&&e.message||e));" +
                 " lxHost.send('__inited_error', JSON.stringify({message:String(e&&e.message||e)}))}"
         )
-        val info = withTimeoutOrNull(60_000) { fresh.await() }
+        val info = withTimeoutOrNull(25_000) { fresh.await() }
             ?: throw IllegalStateException("音源初始化超时")
         activeSources = parseSources(info)
+        repo.notePlatforms(entry.file, activeSources.map { it.key })
         loadedEntry = entry.file
         activeSources
     }
@@ -174,7 +201,8 @@ class Engine(
 
         @JavascriptInterface
         fun log(level: String, msg: String) {
-            log(msg)
+            // 音源脚本的 console 经常在“换备选方案”时刷错误，别弹给用户看
+            android.util.Log.d("lxdl-js", "[$level] $msg")
         }
 
         @JavascriptInterface
@@ -265,19 +293,50 @@ class Engine(
 
     // ---------------- 取链（只解析不下载） ----------------
 
+    /**
+     * 取播放直链。对齐 LX Music 的做法：
+     * 1. 按音源顺序，第一个能给出链接的就用（不再把整条音质链跑一遍）；
+     * 2. 单个音源/音质失败全部静默，只有全都拿不到才报错；
+     * 3. 结果缓存 10 分钟，同一首歌反复试听/复制直链是秒开。
+     */
     suspend fun resolveUrl(item: Track, quality: String): String = withContext(Dispatchers.IO) {
-        for (entry in repo.listSources().take(3)) {
-            val infos = runCatching { loadScript(entry) }.getOrNull() ?: continue
+        UrlCache.get(item.platform, item.id, quality)?.let { return@withContext it }
+        // 预览不能无限等：最多 30 秒，超时就报错（LX 也会很快放弃）
+        withTimeoutOrNull(30_000) { resolveUrlInner(item, quality) }
+            ?: throw IllegalStateException("取链超时，换个音源试试")
+    }
+
+    private suspend fun resolveUrlInner(item: Track, quality: String): String {
+        var supporting = 0
+        for (entry in orderedSources(item.platform)) {
+            if (supporting >= 2) break
+            val infos = loadSources(entry) ?: continue
             val si = infos.firstOrNull { it.key == item.platform } ?: continue
-            val chain = if (si.qualities.contains(quality)) listOf(quality) else qualityChain(si)
-            for (q in chain) {
-                val info = JSONObject().put("type", q).put("musicInfo", musicInfo(item))
-                val v = runCatching { call(item.platform, "musicUrl", info) }.getOrNull() ?: continue
-                extractUrl(v)?.let { return@withContext it }
+            supporting++
+            for (q in qualityChain(si, quality).take(2)) {
+                val url = musicUrl(item, q) ?: continue
+                UrlCache.put(item.platform, item.id, quality, url)
+                return url
             }
         }
-        throw IllegalStateException("音源不可用：没拿到链接")
+        throw IllegalStateException("音源不可用：所有音源都没拿到链接")
     }
+
+    /** 已加载的音源优先、已知支持该平台的优先、已知不支持的排最后。 */
+    private fun orderedSources(platform: String): List<SourceEntry> =
+        repo.listSources()
+            .map { e ->
+                val known = repo.knownPlatforms(e.file)
+                val support = when {
+                    known == null -> 1
+                    known.contains(platform) -> 0
+                    else -> 2
+                }
+                val loaded = if (e.file == loadedEntry) 0 else 1
+                Triple(e, support, loaded)
+            }
+            .sortedWith(compareBy({ it.second }, { it.third }))
+            .map { it.first }
 
     // ---------------- 下载 ----------------
 
@@ -291,42 +350,44 @@ class Engine(
         val meta = mergeMeta(item)
         onStatus("取链中…")
 
-        val entries = repo.listSources().take(3)
+        val entries = orderedSources(item.platform)
         if (entries.isEmpty()) throw IllegalStateException("没有音源")
 
         var active: SourceInfo? = null
         val candidates = mutableListOf<Candidate>()
         var unofficial = false
+        var supporting = 0
         for (entry in entries) {
             if (control.cancelled) throw Cancelled()
-            val infos = runCatching { loadScript(entry) }.getOrNull()
-            if (infos == null) {
-                log("音源 ${entry.name} 加载失败")
-                continue
-            }
+            if (supporting >= 2 || candidates.size >= MAX_CANDIDATES) break
+            val infos = loadSources(entry) ?: continue
             val si = infos.firstOrNull { it.key == item.platform } ?: continue
+            supporting++
             active = si
-            for (quality in qualityChain(si)) {
-                val info = JSONObject().put("type", quality).put("musicInfo", musicInfo(item))
-                val v = runCatching { call(item.platform, "musicUrl", info) }.getOrNull() ?: continue
-                val url = extractUrl(v) ?: continue
+            for (quality in qualityChain(si, repo.cfg.quality).take(2)) {
+                if (candidates.size >= MAX_CANDIDATES) break
+                val url = musicUrl(item, quality) ?: continue
                 if (candidates.any { it.url == url }) continue
                 val official = isOfficial(url)
                 candidates.add(Candidate(url, quality, si.name, official))
-                onStatus("渠道：${si.name} · $quality")
                 if (!official) unofficial = true
-                if (candidates.size >= 6) break
             }
             if (unofficial) break
         }
-        if (candidates.isEmpty()) throw IllegalStateException("音源不可用：前 3 个音源都没能拿到链接")
+        if (candidates.isEmpty()) throw IllegalStateException("音源不可用：所有音源都没拿到链接")
         candidates.sortWith(compareBy({ it.official }, { -qualityRank(it.quality) }))
 
-        onStatus("获取封面/歌词…")
-        val cover = fetchCover(item, active, meta.cover)
-        val lyrics = if (repo.cfg.lyrics) fetchLyrics(item, active) else null
+        // 封面/歌词和下载并行跑，不再串在关键路径上
+        val coverJob = async {
+            runCatching { fetchCover(item, active, meta.cover) }.getOrNull()
+        }
+        val lyricJob = async {
+            if (!repo.cfg.lyrics) null
+            else runCatching { fetchLyrics(item, active) }.getOrNull()
+        }
 
         val expected = meta.durationSec
+        var lastDownloadError: String? = null
         var best: Triple<Candidate, File, Int>? = null
         var attempts = 0
         for (c in candidates) {
@@ -350,13 +411,13 @@ class Engine(
                 tmp.delete()
                 throw e
             } catch (e: Exception) {
-                log("该渠道下载失败：${e.message}")
+                // 单个渠道失败不打扰用户，最后统一报错
+                lastDownloadError = e.message
                 tmp.delete()
                 null
             }
             if (ok == null) continue
             val dur = durationOf(ok)
-            log("渠道时长 ${dur}s")
             val better = best == null || dur > best!!.third
             if (better) {
                 best?.second?.delete()
@@ -367,7 +428,11 @@ class Engine(
             val complete = if (expected > 5) dur + 1 >= expected * 0.92 else dur >= 60
             if (complete) break
         }
-        val picked = best ?: throw IllegalStateException("所有渠道都下载失败")
+        val picked = best ?: throw IllegalStateException(
+            lastDownloadError?.takeIf { it.isNotBlank() } ?: "所有渠道都下载失败"
+        )
+        val cover = coverJob.await()
+        val lyrics = lyricJob.await()
         if (expected > 5 && picked.third + 1 < expected * 0.92) {
             log("注意：最长版本只有 ${picked.third}s，平台标注 ${expected}s，可能是试听片段")
         }
@@ -383,7 +448,7 @@ class Engine(
             tagged, meta.title, meta.artist, meta.album, meta.artist,
             lyrics, cover, guessMime(cover)
         )
-        if (tagError != null) log("写标签失败：$tagError")
+        if (tagError != null) onStatus("标签写入跳过")
 
         val name = buildName(meta, ext)
         onStatus("导出…")
@@ -414,6 +479,28 @@ class Engine(
         )
     }
 
+    /** 加载音源脚本；被取消时不要吞掉 CancellationException，其它错误静默。 */
+    private suspend fun loadSources(entry: SourceEntry): List<SourceInfo>? = try {
+        loadScript(entry)
+    } catch (e: kotlinx.coroutines.CancellationException) {
+        throw e
+    } catch (e: Throwable) {
+        null
+    }
+
+    /** 向音源要直链；失败静默返回 null。 */
+    private suspend fun musicUrl(item: Track, quality: String): String? {
+        val info = JSONObject().put("type", quality).put("musicInfo", musicInfo(item))
+        val v = try {
+            call(item.platform, "musicUrl", info, 25_000)
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Throwable) {
+            return null
+        }
+        return extractUrl(v)
+    }
+
     private fun musicInfo(item: Track): JSONObject = JSONObject()
         .put("source", item.platform)
         .put("songmid", item.id)
@@ -423,11 +510,12 @@ class Engine(
         .put("singer", item.artist)
         .put("albumName", item.album)
 
-    private fun qualityChain(si: SourceInfo): List<String> {
-        if (si.qualities.isEmpty()) return listOf(repo.cfg.quality)
-        return listOf(repo.cfg.quality, "flac24bit", "flac", "320k", "128k")
+    private fun qualityChain(si: SourceInfo, preferred: String): List<String> {
+        if (si.qualities.isEmpty()) return listOf(preferred)
+        return listOf(preferred, "flac24bit", "flac", "320k", "128k")
             .filter { si.qualities.contains(it) }
             .distinct()
+            .ifEmpty { listOf(preferred) }
     }
 
     private fun qualityRank(q: String): Int = when (q) {
@@ -456,20 +544,25 @@ class Engine(
         var url: String? = null
         if (si != null && si.has("pic")) {
             runCatching {
-                val v = call(item.platform, "pic", JSONObject().put("musicInfo", musicInfo(item)), 45_000)
+                val v = call(item.platform, "pic", JSONObject().put("musicInfo", musicInfo(item)), 20_000)
                 url = extractUrl(v)
             }
         }
         if (url == null) url = fallbackUrl
         if (url == null) url = runCatching { providers.detail(item.platform, item.id).cover }.getOrNull()
-        if (url == null) return null
-        return runCatching { http.bytes(url!!, timeoutMs = 25_000) }.getOrNull()
+        val u = url ?: return null
+        CoverCache.get(ctx, u)?.let { return it.readBytes() }
+        val bytes = runCatching {
+            http.bytes(u, mapOf("User-Agent" to UA), timeoutMs = 25_000)
+        }.getOrNull() ?: return null
+        CoverCache.put(ctx, u, bytes)
+        return bytes
     }
 
     private suspend fun fetchLyrics(item: Track, si: SourceInfo?): String? {
         if (si != null && si.has("lyric")) {
             runCatching {
-                val v = call(item.platform, "lyric", JSONObject().put("musicInfo", musicInfo(item)), 45_000)
+                val v = call(item.platform, "lyric", JSONObject().put("musicInfo", musicInfo(item)), 20_000)
                 val text = when (v) {
                     is String -> v
                     is JSONObject -> v.optString("lyric").ifBlank { v.optString("lrc") }

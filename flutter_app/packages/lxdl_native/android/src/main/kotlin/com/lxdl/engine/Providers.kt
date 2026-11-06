@@ -345,6 +345,8 @@ class Providers(private val http: Http, private val repo: Repo) {
     fun parse(platform: String, text: String): Track {
         val t = text.trim()
         if (t.isEmpty()) throw IllegalStateException("没有可解析的内容")
+        // 先认协议链接：netease://song/3443796005 这类深链接
+        parseDeepLink(t)?.let { return it }
         val digit = { s: String, needle: String ->
             val i = s.indexOf(needle)
             if (i < 0) null else s.substring(i + needle.length).takeWhile { it.isDigit() }.ifEmpty { null }
@@ -387,6 +389,49 @@ class Providers(private val http: Http, private val repo: Repo) {
         if (id == null) throw IllegalStateException("无法解析：没认出这个平台的歌曲/歌单 id")
         return Track(
             platform = platform, id = id,
+            isPlaylist = playlist && platform == "wy"
+        )
+    }
+
+    /**
+     * 解析 netease:// / tencent:// / kugou:// / kuwo:// / migu:// 这类深链接。
+     * 支持 song/xxx、playlist/xxx、直接 xxx，以及 ?id=xxx。
+     */
+    private fun parseDeepLink(text: String): Track? {
+        val sep = text.indexOf("://")
+        if (sep <= 0) return null
+        var i = sep - 1
+        while (i >= 0 && (text[i].isLetterOrDigit() || text[i] == '+' || text[i] == '.' || text[i] == '-')) i--
+        val scheme = text.substring(i + 1, sep).lowercase()
+        val platform = when (scheme) {
+            "netease", "163music", "163", "cloudmusic" -> "wy"
+            "tencent", "qqmusic", "qq" -> "tx"
+            "kugou", "kgmusic" -> "kg"
+            "kuwo" -> "kw"
+            "migu" -> "mg"
+            else -> return null
+        }
+        val body = text.substring(sep + 3).trim()
+        var playlist = false
+        var id: String? = null
+        body.substringBefore('?').split('/').forEach { raw ->
+            val part = raw.trim()
+            if (part.isEmpty()) return@forEach
+            when (part.lowercase()) {
+                "song", "music", "track", "detail", "m", "index" -> return@forEach
+                "playlist", "disstid", "album" -> { playlist = true; return@forEach }
+            }
+            // 取这一段里最后一段字母数字（跳过 "song/" 之类前缀和尾部的中文说明）
+            Regex("[A-Za-z0-9_-]{2,}").findAll(part).lastOrNull()?.value?.let { id = it }
+        }
+        if (id.isNullOrBlank()) {
+            id = Regex("[?&](?:id|songid|hash|mid)=([A-Za-z0-9]+)", RegexOption.IGNORE_CASE)
+                .find(text)?.groupValues?.get(1)
+        }
+        val real = id?.takeIf { it.isNotBlank() } ?: return null
+        return Track(
+            platform = platform,
+            id = real,
             isPlaylist = playlist && platform == "wy"
         )
     }

@@ -14,6 +14,7 @@ data class Cfg(
     var quality: String = "320k",
     var naming: String = "{title} - {artist}",
     var outDir: String = "lxdl",
+    var theme: String = "#3A7AF0",
     var lyrics: Boolean = true,
     var lrcSidecar: Boolean = false,
     var concurrency: Int = 1,
@@ -28,6 +29,7 @@ data class Cfg(
         .put("quality", quality)
         .put("naming", naming)
         .put("outDir", outDir)
+        .put("theme", theme)
         .put("lyrics", lyrics)
         .put("lrcSidecar", lrcSidecar)
         .put("concurrency", concurrency)
@@ -51,6 +53,7 @@ data class Cfg(
                 quality = o.optString("quality", "320k"),
                 naming = o.optString("naming", "{title} - {artist}"),
                 outDir = o.optString("outDir", "lxdl"),
+                theme = o.optString("theme", "#3A7AF0"),
                 lyrics = o.optBoolean("lyrics", true),
                 lrcSidecar = o.optBoolean("lrcSidecar", false),
                 concurrency = o.optInt("concurrency", 1).coerceIn(1, 3),
@@ -127,7 +130,15 @@ class Repo(val ctx: Context) {
 
     // ---------------- 音源 ----------------
 
+    // listSources 每次都要把脚本读一遍抽 @name/@version，缓存一下（导入/删除/排序时失效）
+    @Volatile private var sourcesCache: List<SourceEntry>? = null
+
+    fun invalidateSources() {
+        sourcesCache = null
+    }
+
     fun listSources(): List<SourceEntry> {
+        sourcesCache?.let { return it }
         val files = sourcesDir.listFiles { f -> f.isFile && f.name.endsWith(".js") } ?: return emptyList()
         val list = files.map { f ->
             val text = runCatching { f.readText() }.getOrDefault("")
@@ -141,8 +152,19 @@ class Repo(val ctx: Context) {
             val i = order.indexOf(e.name)
             if (i < 0) Int.MAX_VALUE else i
         }
-        return list
+        val result: List<SourceEntry> = list.toList()
+        sourcesCache = result
+        return result
     }
+
+    // 本次运行里学到的「音源 -> 支持平台」，用来跳过不可能命中的脚本
+    private val sourcePlatforms = java.util.concurrent.ConcurrentHashMap<String, List<String>>()
+
+    fun notePlatforms(file: String, platforms: List<String>) {
+        sourcePlatforms[file] = platforms
+    }
+
+    fun knownPlatforms(file: String): List<String>? = sourcePlatforms[file]
 
     fun importSource(input: String, http: Http): SourceEntry {
         val text = if (input.trim().startsWith("http")) http.text(input.trim(), timeoutMs = 60_000) else input
@@ -153,6 +175,7 @@ class Repo(val ctx: Context) {
         File(sourcesDir, "$safe.js").writeText(text)
         if (!cfg.order.contains(name)) cfg.order.add(name)
         saveCfg()
+        invalidateSources()
         return SourceEntry(
             name, "$safe.js",
             Regex("@version\\s+(.+)").find(text)?.groupValues?.get(1)?.trim() ?: "",
@@ -166,6 +189,7 @@ class Repo(val ctx: Context) {
         }?.delete()
         cfg.order.remove(name)
         saveCfg()
+        invalidateSources()
     }
 
     fun moveSource(name: String, delta: Int) {
@@ -179,6 +203,7 @@ class Repo(val ctx: Context) {
         list[j] = tmp
         cfg.order = list.toMutableList()
         saveCfg()
+        invalidateSources()
     }
 
     // ---------------- 下载列表 ----------------
