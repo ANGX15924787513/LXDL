@@ -38,7 +38,14 @@ data class SourceInfo(
     fun has(action: String) = actions.contains(action)
 }
 
-private data class Candidate(val url: String, val quality: String, val source: String, val official: Boolean)
+internal data class Candidate(val url: String, val quality: String, val source: String, val official: Boolean)
+
+/** 预取好的下载素材：元数据 + 候选直链 */
+internal class Prepared(
+    val meta: Track,
+    val candidates: List<Candidate>,
+    val source: SourceInfo?
+)
 
 private const val MAX_CANDIDATES = 3
 
@@ -75,6 +82,7 @@ class Engine(
     var onLog: ((String) -> Unit)? = null
 
     private val main = Handler(Looper.getMainLooper())
+    private val segmenter = SegmentDownloader(http)
     private val pageReady = CompletableDeferred<Unit>()
     private val inited = AtomicReference(CompletableDeferred<JSONObject>())
     private val pending = ConcurrentHashMap<Int, CompletableDeferred<JSONObject>>()
@@ -346,19 +354,24 @@ class Engine(
         control: DownloadControl,
         onProgress: (Double, Long, Long?) -> Unit,
         onStatus: (String) -> Unit
-    ): Exporter.Out = withContext(Dispatchers.IO) {
+    ): Exporter.Out {
+        val ready = prepare(item) ?: throw IllegalStateException("音源不可用：所有音源都没拿到链接")
+        return downloadPrepared(item, key, control, ready, onProgress, onStatus)
+    }
+
+    /**
+     * 只解析直链，不下载。批量下载时先把所有歌的链接并发预取出来，
+     * 下载线程一拿到任务就直接开跑，不用现场等链接。
+     */
+    suspend fun prepare(item: Track): Prepared? = withContext(Dispatchers.IO) {
         val meta = mergeMeta(item)
-        onStatus("取链中…")
-
         val entries = orderedSources(item.platform)
-        if (entries.isEmpty()) throw IllegalStateException("没有音源")
-
-        var active: SourceInfo? = null
+        if (entries.isEmpty()) return@withContext null
         val candidates = mutableListOf<Candidate>()
-        var unofficial = false
+        var active: SourceInfo? = null
         var supporting = 0
+        var unofficial = false
         for (entry in entries) {
-            if (control.cancelled) throw Cancelled()
             if (supporting >= 2 || candidates.size >= MAX_CANDIDATES) break
             val infos = loadSources(entry) ?: continue
             val si = infos.firstOrNull { it.key == item.platform } ?: continue
@@ -374,8 +387,26 @@ class Engine(
             }
             if (unofficial) break
         }
-        if (candidates.isEmpty()) throw IllegalStateException("音源不可用：所有音源都没拿到链接")
-        candidates.sortWith(compareBy({ it.official }, { -qualityRank(it.quality) }))
+        if (candidates.isEmpty()) return@withContext null
+        Prepared(
+            meta = meta,
+            candidates = candidates.sortedWith(compareBy({ it.official }, { -qualityRank(it.quality) })),
+            source = active
+        )
+    }
+
+    suspend fun downloadPrepared(
+        item: Track,
+        key: Int,
+        control: DownloadControl,
+        ready: Prepared,
+        onProgress: (Double, Long, Long?) -> Unit,
+        onStatus: (String) -> Unit
+    ): Exporter.Out = withContext(Dispatchers.IO) {
+        val meta = ready.meta
+        val active = ready.source
+        val candidates = ready.candidates
+        onStatus("下载中…")
 
         // 封面/歌词和下载并行跑，不再串在关键路径上
         val coverJob = async {
@@ -397,7 +428,8 @@ class Engine(
             onStatus("下载 ${c.quality}…")
             val tmp = File(repo.cacheDir, "cand-$key-$attempts.bin")
             val ok = try {
-                http.download(
+                // 分段并发下载；服务器不支持 Range 会自动退回单连接
+                segmenter.download(
                     c.url, tmp, control,
                     mapOf("User-Agent" to UA, "Referer" to refererOf(item.platform))
                 ) { done, total ->
@@ -408,12 +440,12 @@ class Engine(
                 }
                 tmp
             } catch (e: Cancelled) {
-                tmp.delete()
+                cleanTmp(tmp)
                 throw e
             } catch (e: Exception) {
                 // 单个渠道失败不打扰用户，最后统一报错
                 lastDownloadError = e.message
-                tmp.delete()
+                cleanTmp(tmp)
                 null
             }
             if (ok == null) continue
@@ -463,6 +495,12 @@ class Engine(
             lrc.delete()
         }
         out
+    }
+
+    private fun cleanTmp(tmp: File) {
+        tmp.delete()
+        File(tmp.absolutePath + ".part").delete()
+        File(tmp.absolutePath + ".part.json").delete()
     }
 
     private fun mergeMeta(item: Track): Track {

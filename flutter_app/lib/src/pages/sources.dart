@@ -254,30 +254,44 @@ class _SourcesPageState extends State<SourcesPage> {
       child: Padding(
         padding: const EdgeInsets.all(10),
         child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Row(children: [
-            const Text('镜像', style: TextStyle(fontWeight: FontWeight.w600)),
-            const SizedBox(width: 8),
-            Expanded(
-              child: TextField(
-                controller: _mirror,
-                decoration: const InputDecoration(hintText: '可选，API 反代地址'),
+          Theme(
+            data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
+            child: ExpansionTile(
+              tilePadding: EdgeInsets.zero,
+              childrenPadding: const EdgeInsets.only(bottom: 6),
+              shape: const Border(),
+              collapsedShape: const Border(),
+              title: const Text('网络（可选）', style: TextStyle(fontSize: 13)),
+              subtitle: const Text(
+                '默认直连即可，慢的时候再动这里',
+                style: TextStyle(fontSize: 11),
               ),
+              children: [
+                Row(children: [
+                  const SizedBox(width: 44, child: Text('镜像', style: TextStyle(fontSize: 12))),
+                  Expanded(
+                    child: TextField(
+                      controller: _mirror,
+                      decoration: const InputDecoration(hintText: 'API 反代地址'),
+                    ),
+                  ),
+                ]),
+                const SizedBox(height: 6),
+                Row(children: [
+                  const SizedBox(width: 44, child: Text('代理', style: TextStyle(fontSize: 12))),
+                  Expanded(
+                    child: TextField(
+                      controller: _proxy,
+                      decoration: const InputDecoration(hintText: '127.0.0.1:7890'),
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  FilledButton.tonal(onPressed: _saveNet, child: const Text('保存')),
+                ]),
+              ],
             ),
-          ]),
-          const SizedBox(height: 6),
-          Row(children: [
-            const Text('代理', style: TextStyle(fontWeight: FontWeight.w600)),
-            const SizedBox(width: 8),
-            Expanded(
-              child: TextField(
-                controller: _proxy,
-                decoration: const InputDecoration(hintText: '可选，127.0.0.1:7890'),
-              ),
-            ),
-            const SizedBox(width: 6),
-            FilledButton.tonal(onPressed: _saveNet, child: const Text('保存')),
-          ]),
-          const Divider(height: 16),
+          ),
+          const Divider(height: 12),
           Row(children: [
             const Text('并发'),
             const SizedBox(width: 8),

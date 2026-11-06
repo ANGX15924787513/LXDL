@@ -65,7 +65,6 @@ class _SearchPageState extends State<SearchPage> {
   int _namingIndex = 0;
   String _customTemplate = '{title} - {artist}';
   bool _lyrics = true;
-  bool _hasMirror = false;
   List<String> _history = [];
   final _keyword = TextEditingController();
   final _share = TextEditingController();
@@ -117,8 +116,6 @@ class _SearchPageState extends State<SearchPage> {
         _dir.text = cfg['outDir'] as String? ?? 'lxdl';
         _lyrics = cfg['lyrics'] as bool? ?? true;
         _history = ((cfg['history'] as List?) ?? []).cast<String>();
-        _hasMirror = ((cfg['mirror'] as String?) ?? '').trim().isNotEmpty ||
-            ((cfg['proxy'] as String?) ?? '').trim().isNotEmpty;
         final q = cfg['quality'] as String? ?? '320k';
         _quality = _qualities.indexOf(q).clamp(0, 3).toInt();
         final n = cfg['naming'] as String? ?? _naming[0].$2;
@@ -139,8 +136,6 @@ class _SearchPageState extends State<SearchPage> {
       final cfg = jsonDecode(raw ?? '{}') as Map<String, dynamic>;
       if (!mounted) return;
       setState(() {
-        _hasMirror = ((cfg['mirror'] as String?) ?? '').trim().isNotEmpty ||
-            ((cfg['proxy'] as String?) ?? '').trim().isNotEmpty;
         _history = ((cfg['history'] as List?) ?? []).cast<String>();
       });
     } catch (_) {}
@@ -357,20 +352,6 @@ class _SearchPageState extends State<SearchPage> {
   Future<void> _download() async {
     final t = _preview;
     if (t == null) return;
-    await _refreshMirror();
-    if (!_hasMirror) {
-      final go = await showDialog<bool>(
-        context: context,
-        builder: (ctx) => AlertDialog(
-          content: const Text('未配置镜像/代理，下载可能很慢'),
-          actions: [
-            TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('取消')),
-            FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('继续')),
-          ],
-        ),
-      );
-      if (go != true) return;
-    }
     if (t['playlist'] == true) {
       await _pickPlaylist(t);
       return;

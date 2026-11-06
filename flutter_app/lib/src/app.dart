@@ -305,8 +305,8 @@ class _CoverBackdropState extends State<_CoverBackdrop> {
                   children: [
                     ImageFiltered(
                       imageFilter: ImageFilter.blur(
-                        sigmaX: 28,
-                        sigmaY: 28,
+                        sigmaX: 20,
+                        sigmaY: 20,
                         tileMode: TileMode.decal,
                       ),
                       child: Image.file(

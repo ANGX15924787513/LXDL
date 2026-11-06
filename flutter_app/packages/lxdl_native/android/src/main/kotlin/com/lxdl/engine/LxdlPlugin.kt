@@ -367,6 +367,9 @@ class LxdlPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAware
                     it.cancelled = true
                     it.paused = false
                     runCatching { it.call?.cancel() }
+                    synchronized(it.calls) { it.calls.toList() }.forEach { c ->
+                        runCatching { c.cancel() }
+                    }
                 }
                 base().first.fail(key, "已取消")
                 reply(result, true)
@@ -527,14 +530,45 @@ class LxdlPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAware
             return
         }
         val n = r.cfg.concurrency.coerceIn(1, 3)
+        // 先把任务全部登记出来，列表立刻可见、随时可取消
+        val items = tracks.map { r.addItem(it) }
+        val controlsLocal = items.associate { it.key to DownloadControl() }
+        controlsLocal.forEach { (k, c) -> controls[k] = c }
+        sendEvent("downloads")
+
         // 槽位池：一个槽对应一个 WebView 引擎，保证同时在跑的任务不会共用同一个脚本上下文
         val slots = Channel<Int>(n)
         repeat(n) { runCatching { slots.trySend(it) } }
-        tracks.forEach { t ->
+
+        // 批量时另开一条车道预取直链：链接比下载快得多，下载线程永不等链接
+        val prefetch = tracks.size > 2
+        val ready = ConcurrentHashMap<Int, CompletableDeferred<Prepared?>>()
+        if (prefetch) {
+            items.indices.forEach { ready[it] = CompletableDeferred() }
+            scope.launch {
+                runCatching {
+                    val eng = interactiveEngine()
+                    tracks.forEachIndexed { i, t ->
+                        val c = controlsLocal[items[i].key]
+                        if (c?.cancelled == true) {
+                            ready[i]?.complete(null)
+                            return@forEachIndexed
+                        }
+                        val p = runCatching { eng.prepare(t) }.getOrNull()
+                        ready[i]?.complete(p)
+                    }
+                }.onFailure {
+                    items.indices.forEach { i -> ready[i]?.complete(null) }
+                }
+            }
+        }
+
+        tracks.forEachIndexed { i, t ->
             scope.launch {
                 val worker = slots.receive()
                 try {
-                    downloadOne(t, worker)
+                    val prepared = if (prefetch) ready[i]?.await() else null
+                    downloadOne(t, items[i], controlsLocal[items[i].key]!!, worker, prepared)
                 } finally {
                     runCatching { slots.trySend(worker) }
                 }
@@ -548,29 +582,40 @@ class LxdlPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAware
         caps?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) == true
     }.getOrDefault(true)
 
-    private suspend fun downloadOne(t: Track, worker: Int) {
+    private suspend fun downloadOne(
+        t: Track,
+        item: Item,
+        control: DownloadControl,
+        worker: Int,
+        prepared: Prepared?,
+    ) {
         val (r, _) = base()
-        val item = r.addItem(t)
-        val control = DownloadControl()
-        controls[item.key] = control
-        sendEvent("downloads")
+        if (control.cancelled) {
+            r.fail(item.key, "已取消")
+            controls.remove(item.key)
+            sendEvent("downloads")
+            return
+        }
         runCatching { Notifier.start(appCtx, t.title) }
         var lastNotify = 0L
         try {
             val engine = engineAt(worker)
-            val out = engine.downloadSong(
-                t, item.key, control,
-                onProgress = { pr, done, total ->
-                    r.progress(item.key, done, total)
-                    sendEvent("progress", item.key, pr)
-                    val now = System.currentTimeMillis()
-                    if (now - lastNotify > 1200) {
-                        lastNotify = now
-                        Notifier.update(appCtx, t.title, done, total ?: 0)
-                    }
-                },
-                onStatus = { s -> sendEvent("log", s) }
-            )
+            val onProgress: (Double, Long, Long?) -> Unit = { pr, done, total ->
+                r.progress(item.key, done, total)
+                sendEvent("progress", item.key, pr)
+                val now = System.currentTimeMillis()
+                if (now - lastNotify > 1200) {
+                    lastNotify = now
+                    Notifier.update(appCtx, t.title, done, total ?: 0)
+                }
+            }
+            val onStatus: (String) -> Unit = { s -> sendEvent("log", s) }
+            val out = if (prepared != null) {
+                engine.downloadPrepared(t, item.key, control, prepared, onProgress, onStatus)
+            } else {
+                // 预取失败/单曲下载：回退到现场解析
+                engine.downloadSong(t, item.key, control, onProgress, onStatus)
+            }
             r.finish(item.key, out.display, out.uri)
             Notifier.done(appCtx, t.title, out.uri, out.display)
             sendEvent("log", "完成：${out.display}")

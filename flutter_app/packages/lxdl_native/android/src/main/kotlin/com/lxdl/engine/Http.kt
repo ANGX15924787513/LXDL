@@ -1,5 +1,7 @@
 package com.lxdl.engine
 
+import okhttp3.ConnectionPool
+import okhttp3.Dispatcher
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -30,7 +32,12 @@ internal fun refererOf(platform: String): String = when (platform) {
 class DownloadControl {
     @Volatile var paused = false
     @Volatile var cancelled = false
+
+    /** 单连接下载时的那一个请求 */
     @Volatile var call: okhttp3.Call? = null
+
+    /** 分段下载时并发的多个请求，取消要一起断掉 */
+    val calls: MutableList<okhttp3.Call> = java.util.Collections.synchronizedList(mutableListOf())
 }
 
 class Cancelled : IOException("已取消")
@@ -54,6 +61,12 @@ class Http {
             .writeTimeout(40, TimeUnit.SECONDS)
             .followRedirects(true)
             .followSslRedirects(true)
+            // 分段下载/多任务同时跑：放宽每主机并发与连接复用
+            .dispatcher(Dispatcher().apply {
+                maxRequests = 64
+                maxRequestsPerHost = 16
+            })
+            .connectionPool(ConnectionPool(16, 5, TimeUnit.MINUTES))
         val p = parseProxy(proxy)
         if (p != null) b.proxy(p)
         return b.build()
