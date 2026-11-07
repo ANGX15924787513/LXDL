@@ -1,1 +1,12 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android"/>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- 公共下载目录写不进去时（部分 ROM 会拦），退回 App 自己的外部目录并在这里共享出去 -->
+    <provider
+        android:name="androidx.core.content.FileProvider"
+        android:authorities="${applicationId}.lxdl.files"
+        android:exported="false"
+        android:grantUriPermissions="true">
+        <meta-data
+            android:name="android.support.FILE_PROVIDER_PATHS"
+            android:resource="@xml/lxdl_file_paths" />
+    </provider>
+</manifest>

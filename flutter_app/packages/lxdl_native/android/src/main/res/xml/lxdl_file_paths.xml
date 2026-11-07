@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <external-files-path name="lxdl_external" path="." />
+    <files-path name="lxdl_internal" path="." />
+    <cache-path name="lxdl_cache" path="." />
+</paths>
