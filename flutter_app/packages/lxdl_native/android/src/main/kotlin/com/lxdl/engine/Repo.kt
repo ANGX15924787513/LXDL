@@ -60,7 +60,9 @@ data class Cfg(
                 naming = o.optString("naming", "{title} - {artist}"),
                 outDir = o.optString("outDir", "lxdl"),
                 theme = o.optString("theme", "#3A7AF0"),
-                engine = o.optString("engine", "webview").let { if (it == "quickjs") "quickjs" else "webview" },
+                engine = o.optString("engine", "webview").let {
+                    when (it) { "quickjs", "rquickjs" -> it; else -> "webview" }
+                },
                 builtinSourceVersion = o.optString("builtinSourceVersion", ""),
                 lyrics = o.optBoolean("lyrics", true),
                 lrcSidecar = o.optBoolean("lrcSidecar", false),

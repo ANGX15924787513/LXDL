@@ -61,7 +61,8 @@ class _SourcesPageState extends State<SourcesPage> {
         _outTree = cfg['outTree'] as String? ?? '';
         final t = (cfg['theme'] as String?)?.trim() ?? '';
         if (t.isNotEmpty) _theme = t.toUpperCase();
-        _engine = (cfg['engine'] as String?) == 'quickjs' ? 'quickjs' : 'webview';
+        final e = cfg['engine'] as String?;
+        _engine = (e == 'quickjs' || e == 'rquickjs') ? e! : 'webview';
       });
     } catch (_) {}
   }
@@ -351,6 +352,7 @@ class _SourcesPageState extends State<SourcesPage> {
                   segments: const [
                     ButtonSegment(value: 'webview', label: Text('WebView')),
                     ButtonSegment(value: 'quickjs', label: Text('QuickJS')),
+                    ButtonSegment(value: 'rquickjs', label: Text('Rust')),
                   ],
                   selected: {_engine},
                   showSelectedIcon: false,

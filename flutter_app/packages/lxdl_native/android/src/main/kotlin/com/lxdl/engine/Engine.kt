@@ -88,8 +88,14 @@ class Engine(
     private val web: WebView?,
     private val providers: Providers
 ) {
-    /** web == null 时走 QuickJS 引擎（设置里可切换，默认 WebView）。 */
-    private val quick: Boolean = web == null
+    /** web == null 时走内存引擎：engine=rquickjs 用 Rust，其余用 QuickJS。 */
+    private val rustMode: Boolean = web == null && repo.cfg.engine == "rquickjs"
+    private val quick: Boolean = web == null && !rustMode
+    @Volatile private var rustRef: RustEngine? = null
+
+    private fun rust(): RustEngine = rustRef ?: synchronized(this) {
+        rustRef ?: RustEngine(http).also { rustRef = it }
+    }
     var onLog: ((String) -> Unit)? = null
 
     private val main = Handler(Looper.getMainLooper())
@@ -132,6 +138,8 @@ class Engine(
     }
 
     fun detach() {
+        runCatching { rustRef?.close() }
+        rustRef = null
         quickClosed = true
         quickTimers.values.forEach { runCatching { it.cancel() } }
         quickTimers.clear()
@@ -213,6 +221,7 @@ class Engine(
 
     suspend fun call(source: String, action: String, info: JSONObject, timeoutMs: Int = 90_000): Any? =
         withContext(Dispatchers.IO) {
+            if (rustMode) return@withContext callRust(source, action, info, timeoutMs)
             if (quick) return@withContext callQuick(source, action, info, timeoutMs)
             val id = seq.getAndIncrement()
             val d = CompletableDeferred<JSONObject>()
@@ -363,6 +372,24 @@ class Engine(
             evalLock.unlock()
         }
     }
+
+    private suspend fun loadScriptRust(entry: SourceEntry): List<SourceInfo> {
+        if (loadedEntry == entry.file && activeSources.isNotEmpty()) return activeSources
+        val code = File(repo.sourcesDir, entry.file).readText()
+        val meta = JSONObject().put("name", entry.name).put("version", entry.version)
+            .put("author", entry.author).put("rawScript", code).toString()
+        val info = runCatching { rust().loadScript(entry, code, meta) }
+            .getOrElse { throw IllegalStateException("Rust 引擎加载失败：${it.message}") }
+        activeSources = parseSources(info)
+        repo.notePlatforms(entry.file, activeSources.map { it.key })
+        loadedEntry = entry.file
+        return activeSources
+    }
+
+    private suspend fun callRust(source: String, action: String, info: JSONObject, timeoutMs: Int): Any? =
+        withContext(Dispatchers.IO) {
+            rust().call(source, action, info, timeoutMs)
+        }
 
     private suspend fun loadScriptQuick(entry: SourceEntry): List<SourceInfo> {
         quickEnsureStarted()

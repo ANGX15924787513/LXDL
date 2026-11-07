@@ -177,7 +177,7 @@ class LxdlPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAware
 
     private fun createEngine(): Engine {
         val (r, p) = base()
-        val e = if (r.cfg.engine == "quickjs") {
+        val e = if (r.cfg.engine == "quickjs" || r.cfg.engine == "rquickjs") {
             // QuickJS：纯内存引擎，不需要 WebView / Activity
             Engine(appCtx, r, h(), null, p)
         } else {
@@ -260,7 +260,8 @@ class LxdlPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAware
                 r.cfg.naming = o.optString("naming", r.cfg.naming)
                 r.cfg.outDir = o.optString("outDir", r.cfg.outDir)
                 r.cfg.theme = o.optString("theme", r.cfg.theme)
-                val newEngine = o.optString("engine", r.cfg.engine).let { if (it == "quickjs") "quickjs" else "webview" }
+                val newEngine = o.optString("engine", r.cfg.engine)
+                    .let { when (it) { "quickjs", "rquickjs" -> it; else -> "webview" } }
                 val engineChanged = newEngine != r.cfg.engine
                 r.cfg.engine = newEngine
                 r.cfg.lyrics = o.optBoolean("lyrics", r.cfg.lyrics)
