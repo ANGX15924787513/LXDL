@@ -1,31 +1,33 @@
 package com.lxdl.engine
 
+import android.annotation.SuppressLint
 import android.content.Context
 import android.media.MediaMetadataRetriever
+import android.os.Handler
+import android.os.Looper
 import android.util.Base64
-import com.dokar.quickjs.QuickJs
-import com.dokar.quickjs.binding.asyncFunction
-import com.dokar.quickjs.binding.function
+import android.webkit.JavascriptInterface
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import kotlinx.coroutines.CompletableDeferred
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import okhttp3.Call
+import okhttp3.Callback
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 
 data class SourceInfo(
     val key: String,
@@ -70,199 +72,99 @@ internal object UrlCache {
     }
 }
 
-/**
- * 音源脚本宿主：用 QuickJS 直接跑 LX 脚本，不再依赖 WebView。
- * QuickJS 上下文创建是一次内存分配，没有 WebView 的进程初始化/页面加载开销。
- */
 class Engine(
     private val ctx: Context,
     private val repo: Repo,
     private val http: Http,
+    private val web: WebView,
     private val providers: Providers
 ) {
     var onLog: ((String) -> Unit)? = null
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val main = Handler(Looper.getMainLooper())
     private val segmenter = SegmentDownloader(http)
-    @Volatile private var qjs: QuickJs = QuickJs.create(Dispatchers.Default)
-    private val evalLock = Mutex()
-    private val startLock = Mutex()
-    @Volatile private var initedPayload: JSONObject? = null
-    @Volatile private var initedError: String? = null
-    private val pendingResults = ConcurrentHashMap<Int, CompletableDeferred<JSONObject>>()
-    private val timerJobs = ConcurrentHashMap<Long, Job>()
+    private val pageReady = CompletableDeferred<Unit>()
+    private val inited = AtomicReference(CompletableDeferred<JSONObject>())
+    private val pending = ConcurrentHashMap<Int, CompletableDeferred<JSONObject>>()
+    private val calls = ConcurrentHashMap<Int, Call>()
     private val seq = AtomicInteger(1)
     private var activeSources: List<SourceInfo> = emptyList()
     @Volatile private var lastScriptError: String? = null
     private var loadedEntry: String? = null
-    @Volatile private var started = false
-    @Volatile private var closed = false
 
-    /**
-     * 卡死的运行时直接换一个：不 close（native 里可能还有卡住的 evaluate，close 有风险），
-     * 让它自生自灭，下次用新实例。
-     */
-    private fun abandonRuntime() {
-        val old = qjs
-        qjs = QuickJs.create(Dispatchers.Default)
-        started = false
-        initedPayload = null
-        initedError = null
-        scope.launch { runCatching { old.close() } }
+    @SuppressLint("SetJavaScriptEnabled")
+    fun start() {
+        main.post {
+            web.settings.javaScriptEnabled = true
+            web.settings.domStorageEnabled = true
+            web.settings.allowFileAccess = true
+            web.webViewClient = object : WebViewClient() {
+                override fun onPageFinished(view: WebView?, url: String?) {
+                    if (!pageReady.isCompleted) pageReady.complete(Unit)
+                }
+            }
+            web.addJavascriptInterface(Bridge(), "lxHost")
+            web.loadUrl("file:///android_asset/lx_host.html")
+        }
     }
 
     fun detach() {
-        closed = true
-        timerJobs.values.forEach { runCatching { it.cancel() } }
-        timerJobs.clear()
-        runCatching { qjs.close() }
+        main.post {
+            runCatching { (web.parent as? android.view.ViewGroup)?.removeView(web) }
+            runCatching { web.destroy() }
+        }
     }
 
     private fun log(text: String) {
         onLog?.invoke(text)
     }
 
-    private fun q(s: String): String = JSONObject.quote(s)
-
     // ---------------- JS 调用 ----------------
 
-    /** QuickJS 实例不是线程安全的，所有 evaluate 串行。 */
-    private suspend fun eval(js: String, filename: String = "lx.js"): Any? {
-        if (closed) throw IllegalStateException("JS 引擎已释放")
-        evalLock.lock()
-        try {
-            return qjs.evaluate<Any?>(js, filename)
-        } finally {
-            evalLock.unlock()
-        }
-    }
-
-    private suspend fun ensureStarted() {
-        if (started) return
-        startLock.lock()
-        try {
-            if (started) return
-            installBindings()
-            val shim = ctx.assets.open("lx_host.js").bufferedReader().use { it.readText() }
-            eval(shim, "lx_host.js")
-            started = true
-        } finally {
-            startLock.unlock()
-        }
-    }
-
-    private fun installBindings() {
-        qjs.function<Any?>("__hostLog") { args ->
-            val level = args.getOrNull(0)?.toString() ?: "log"
-            val msg = args.getOrNull(1)?.toString() ?: ""
-            // 音源脚本的 console 经常在“换备选方案”时刷错误，别弹给用户看
-            android.util.Log.d("lxdl-js", "[$level] $msg")
-            null
-        }
-        qjs.function<Any?>("__hostSend") { args ->
-            runCatching {
-                val name = args.getOrNull(0)?.toString() ?: ""
-                val json = args.getOrNull(1)?.toString() ?: "{}"
-                val o = JSONObject(json)
-                when (name) {
-                    // 这里只记录，不唤醒任何协程：evaluate 还在跑的时候让别的协程恢复执行，
-                    // 会再发起一次 evaluate，和正在等待 async job 的这次撞上。
-                    "inited" -> initedPayload = o
-                    "updateAlert" -> log("音源提示：" + o.optString("log"))
-                    "__inited_error" -> initedError = o.optString("message")
-                    "__result" -> pendingResults.remove(o.optInt("id"))?.complete(o)
+    private fun eval(js: String): String? = withLock {
+        var result: String? = null
+        val latch = CountDownLatch(1)
+        main.post {
+            try {
+                web.evaluateJavascript(js) { value ->
+                    result = value
+                    latch.countDown()
                 }
+            } catch (e: Throwable) {
+                latch.countDown()
             }
-            null
         }
-        qjs.function<String>("__hostMd5") { args ->
-            Crypto.md5(args.getOrNull(0)?.toString() ?: "")
-        }
-        qjs.function<String>("__hostAes") { args ->
-            val data = args.getOrNull(0)?.toString() ?: ""
-            val mode = args.getOrNull(1)?.toString() ?: "cbc"
-            val key = args.getOrNull(2)?.toString() ?: ""
-            val iv = args.getOrNull(3)?.toString() ?: ""
-            runCatching { Crypto.aes(data, mode, key, iv) }
-                .getOrElse { "\u0001ERR:${it.message}" }
-        }
-        qjs.function<String>("__hostRsa") { args ->
-            val data = args.getOrNull(0)?.toString() ?: ""
-            val pem = args.getOrNull(1)?.toString() ?: ""
-            runCatching { Crypto.rsa(data, pem) }
-                .getOrElse { "\u0001ERR:${it.message}" }
-        }
-        qjs.function<String>("__hostRandom") { args ->
-            Crypto.random((args.getOrNull(0) as? Number)?.toInt() ?: 0)
-        }
-        qjs.asyncFunction<String>("__hostFetch") { args ->
-            val url = args.getOrNull(0)?.toString() ?: ""
-            val opts = args.getOrNull(1)?.toString() ?: "{}"
-            withContext(Dispatchers.IO) { doRequest(url, JSONObject(opts)) }
-        }
-        qjs.function<Long>("__hostSetTimeout") { args ->
-            val id = (args.getOrNull(0) as? Number)?.toLong() ?: 0L
-            val ms = (args.getOrNull(1) as? Number)?.toLong() ?: 0L
-            timerJobs.remove(id)?.cancel()
-            timerJobs[id] = scope.launch {
-                delay(ms.coerceIn(0L, 600_000L))
-                timerJobs.remove(id)
-                runCatching { eval("globalThis.__fireTimer && globalThis.__fireTimer($id);", "timer.js") }
-            }
-            id
-        }
-        qjs.function<Any?>("__hostClearTimeout") { args ->
-            val id = (args.getOrNull(0) as? Number)?.toLong() ?: 0L
-            timerJobs.remove(id)?.cancel()
-            null
-        }
+        latch.await(8, TimeUnit.SECONDS)
+        result
     }
 
-    /** 同步 HTTP，供 JS 侧 await；返回值是 JSON 信封。 */
-    private fun doRequest(url: String, o: JSONObject): String {
-        if (!url.startsWith("http")) throw IllegalArgumentException("bad url")
-        val method = o.optString("method", "GET")
-        val timeout = o.optLong("timeout", 20_000)
-        val headers = o.optJSONObject("headers")
-        val bodyText = if (o.isNull("body")) null else o.optString("body")
-        val bodyEnc = o.optString("bodyEncoding", "text")
-        val bodyBytes = bodyText?.let {
-            if (bodyEnc == "base64") Base64.decode(it, Base64.NO_WRAP) else it.toByteArray()
+    private fun withLock(block: () -> String?): String? = synchronized(this) { block() }
+
+    private fun q(s: String): String = JSONObject.quote(s)
+
+    /** 加载（切换）音源脚本，返回它上报的 sources。 */
+    suspend fun loadScript(entry: SourceEntry): List<SourceInfo> = withContext(Dispatchers.IO) {
+        withTimeoutOrNull(20_000) { pageReady.await() } ?: throw IllegalStateException("JS 引擎启动超时")
+        if (loadedEntry == entry.file && activeSources.isNotEmpty()) return@withContext activeSources
+        if (eval("(window.__lxReady === true) ? 1 : 0") != "1") {
+            throw IllegalStateException("JS 宿主没加载起来（lx_host.html 缺失或被拦截）")
         }
-        val builder = Request.Builder().url(url).header("User-Agent", UA)
-        if (headers != null) {
-            headers.keys().forEach { k -> builder.header(k, headers.optString(k)) }
-        }
-        // 表单 POST 要靠请求头里的 Content-Type，别被默认的 octet-stream 盖掉
-        // 注意 JSONObject.keys() 是 Iterator，没有带 predicate 的 firstOrNull，先转成 Sequence
-        val ctype = headers?.let { h ->
-            h.keys().asSequence()
-                .firstOrNull { k -> k.equals("content-type", true) }
-                ?.let { k -> h.optString(k) }
-        }?.takeIf { it.isNotBlank() } ?: "application/octet-stream"
-        val media = runCatching { ctype.toMediaType() }.getOrNull()
-            ?: "application/octet-stream".toMediaType()
-        val rb = bodyBytes?.toRequestBody(media)
-        if (rb != null) builder.method(method, rb) else builder.method(method, null)
-        val call = http.client.newBuilder()
-            .callTimeout(timeout, TimeUnit.MILLISECONDS)
-            .build()
-            .newCall(builder.build())
-        call.execute().use { r ->
-            val bytes = r.body?.bytes() ?: ByteArray(0)
-            val rtype = r.header("Content-Type") ?: ""
-            val binary = o.optString("responseType") == "arraybuffer" ||
-                !(rtype.startsWith("text/") || rtype.contains("json") || rtype.contains("xml"))
-            val headerObj = JSONObject()
-            r.headers.forEach { (k, v) -> headerObj.put(k.lowercase(), v) }
-            return JSONObject()
-                .put("status", r.code)
-                .put("statusText", r.message)
-                .put("headers", headerObj)
-                .put("body", Base64.encodeToString(bytes, Base64.NO_WRAP))
-                .put("binary", binary)
-                .toString()
-        }
+        val fresh = CompletableDeferred<JSONObject>()
+        inited.set(fresh)
+        val code = File(repo.sourcesDir, entry.file).readText()
+        val meta = JSONObject().put("name", entry.name).put("version", entry.version)
+            .put("author", entry.author).put("rawScript", code)
+        eval("window.__lxSetScriptInfo(${q(meta.toString())});")
+        eval(
+            "try{\n" + code + "\n}catch(e){lxHost.log('error', String(e&&e.message||e));" +
+                " lxHost.send('__inited_error', JSON.stringify({message:String(e&&e.message||e)}))}"
+        )
+        val info = withTimeoutOrNull(25_000) { fresh.await() }
+            ?: throw IllegalStateException("音源初始化超时")
+        activeSources = parseSources(info)
+        repo.notePlatforms(entry.file, activeSources.map { it.key })
+        loadedEntry = entry.file
+        activeSources
     }
 
     private fun parseSources(initedJson: JSONObject): List<SourceInfo> {
@@ -277,71 +179,126 @@ class Engine(
         return out
     }
 
-    /** 加载（切换）音源脚本，返回它上报的 sources。 */
-    suspend fun loadScript(entry: SourceEntry): List<SourceInfo> = withContext(Dispatchers.IO) {
-        if (loadedEntry == entry.file && activeSources.isNotEmpty()) return@withContext activeSources
-        ensureStarted()
-        initedPayload = null
-        initedError = null
-        val code = File(repo.sourcesDir, entry.file).readText()
-        val meta = JSONObject().put("name", entry.name).put("version", entry.version)
-            .put("author", entry.author).put("rawScript", code)
-        eval("globalThis.__lxScriptInfo = ${meta};", "meta.js")
-        val evalStart = System.currentTimeMillis()
-        try {
-            withTimeoutOrNull(60_000) { eval("(function () {\n" + code + "\n})();", entry.file) }
-                ?: throw IllegalStateException(
-                    "音源脚本执行超时（60s，脚本 ${code.length} 字符，来自 ${entry.file}）"
-                )
-        } catch (e: IllegalStateException) {
-            // 超时：运行时多半卡住了，换一个新的，别让后续任务继续等它
-            android.util.Log.w("lxdl-js", "script eval timeout after ${System.currentTimeMillis() - evalStart}ms")
-            abandonRuntime()
-            throw e
-        } catch (e: Throwable) {
-            android.util.Log.w("lxdl-js", "script eval failed after ${System.currentTimeMillis() - evalStart}ms: ${e.message}")
-            throw IllegalStateException("音源脚本执行失败：${e.message}")
-        }
-        android.util.Log.i("lxdl-js", "script ${entry.file} eval ${System.currentTimeMillis() - evalStart}ms")
-
-        // 轮询等脚本上报 inited（不在这里 await 一个 deferred，避免唤醒重入）
-        val deadline = System.currentTimeMillis() + 30_000
-        while (initedPayload == null && initedError == null && System.currentTimeMillis() < deadline) {
-            delay(10)
-        }
-        val scriptErr = initedError
-        if (scriptErr != null) throw IllegalStateException("音源初始化失败：$scriptErr")
-        val info = initedPayload ?: throw IllegalStateException("音源初始化超时（脚本没有上报 inited）")
-        activeSources = parseSources(info)
-        repo.notePlatforms(entry.file, activeSources.map { it.key })
-        loadedEntry = entry.file
-        activeSources
-    }
-
     suspend fun call(source: String, action: String, info: JSONObject, timeoutMs: Int = 90_000): Any? =
         withContext(Dispatchers.IO) {
-            ensureStarted()
             val id = seq.getAndIncrement()
             val d = CompletableDeferred<JSONObject>()
-            pendingResults[id] = d
-            val r = try {
-                withTimeoutOrNull(timeoutMs + 10_000L) {
-                    eval("__lxAction($id, ${q(source)}, ${q(action)}, ${q(info.toString())});", "action.js")
-                    d.await()
-                } ?: run {
-                    pendingResults.remove(id)
-                    throw IllegalStateException("音源响应超时")
-                }
-            } catch (e: IllegalStateException) {
-                pendingResults.remove(id)
-                throw e
-            } catch (e: Throwable) {
-                pendingResults.remove(id)
-                throw IllegalStateException("音源脚本调用失败：${e.message}")
-            }
+            pending[id] = d
+            eval("window.__lxAction($id, ${q(source)}, ${q(action)}, ${q(info.toString())}, $timeoutMs)")
+            val r = withTimeoutOrNull(timeoutMs + 10_000L) { d.await() }
+                ?: run { pending.remove(id); throw IllegalStateException("音源响应超时") }
             if (!r.optBoolean("ok")) throw IllegalStateException(r.optString("error", "音源返回错误"))
             r.opt("value")
         }
+
+    // ---------------- JS 桥 ----------------
+
+    inner class Bridge {
+        @JavascriptInterface
+        fun send(name: String, json: String) {
+            runCatching {
+                val o = JSONObject(json)
+                when (name) {
+                    "inited" -> if (!inited.get().isCompleted) inited.get().complete(o)
+                    "updateAlert" -> log("音源提示：" + o.optString("log"))
+                    "__inited_error" -> if (!inited.get().isCompleted)
+                        inited.get().completeExceptionally(IllegalStateException(o.optString("message")))
+                    "__result" -> pending.remove(o.optInt("id"))?.complete(o)
+                }
+            }
+        }
+
+        @JavascriptInterface
+        fun log(level: String, msg: String) {
+            // 音源脚本的 console 经常在“换备选方案”时刷错误，别弹给用户看
+            android.util.Log.d("lxdl-js", "[$level] $msg")
+        }
+
+        @JavascriptInterface
+        fun cancel(id: Int) {
+            calls.remove(id)?.cancel()
+        }
+
+        @JavascriptInterface
+        fun md5(text: String): String = Crypto.md5(text)
+
+        @JavascriptInterface
+        fun aesEncrypt(data: String, mode: String, key: String, iv: String): String =
+            runCatching { Crypto.aes(data, mode, key, iv) }.getOrElse { "\u0001ERR:${it.message}" }
+
+        @JavascriptInterface
+        fun rsaEncrypt(data: String, pem: String): String =
+            runCatching { Crypto.rsa(data, pem) }.getOrElse { "\u0001ERR:${it.message}" }
+
+        @JavascriptInterface
+        fun randomBytes(size: Int): String = Crypto.random(size)
+
+        @JavascriptInterface
+        fun request(id: Int, url: String, optsJson: String) {
+            runCatching { fire(id, url, JSONObject(optsJson)) }.onFailure { e ->
+                dispatch(id, e.message ?: "request error", 0, "", "{}", "", false)
+            }
+        }
+
+        private fun fire(id: Int, url: String, o: JSONObject) {
+            if (!url.startsWith("http")) throw IllegalArgumentException("bad url")
+            val method = o.optString("method", "GET")
+            val timeout = o.optLong("timeout", 20_000)
+            val headers = o.optJSONObject("headers")
+            val bodyText = if (o.isNull("body")) null else o.optString("body")
+            val bodyEnc = o.optString("bodyEncoding", "text")
+            val bodyBytes = bodyText?.let {
+                if (bodyEnc == "base64") Base64.decode(it, Base64.NO_WRAP) else it.toByteArray()
+            }
+            val builder = Request.Builder().url(url).header("User-Agent", UA)
+            if (headers != null) {
+                headers.keys().forEach { k -> builder.header(k, headers.optString(k)) }
+            }
+            // 表单 POST 要靠请求头里的 Content-Type，别被默认的 octet-stream 盖掉
+            // 注意 JSONObject.keys() 是 Iterator，没有带 predicate 的 firstOrNull，先转成 Sequence
+            val ctype = headers?.let { h ->
+                h.keys().asSequence()
+                    .firstOrNull { k -> k.equals("content-type", true) }
+                    ?.let { k -> h.optString(k) }
+            }?.takeIf { it.isNotBlank() } ?: "application/octet-stream"
+            val media = runCatching { ctype.toMediaType() }.getOrNull()
+                ?: "application/octet-stream".toMediaType()
+            val rb = bodyBytes?.toRequestBody(media)
+            if (rb != null) builder.method(method, rb) else builder.method(method, null)
+            val call = http.client.newCall(builder.build())
+            call.timeout().timeout(timeout, TimeUnit.MILLISECONDS)
+            calls[id] = call
+            call.enqueue(object : Callback {
+                override fun onFailure(c: Call, e: java.io.IOException) {
+                    dispatch(id, e.message ?: "network error", 0, "", "{}", "", false)
+                }
+
+                override fun onResponse(c: Call, response: Response) {
+                    response.use { r ->
+                        val bytes = r.body?.bytes() ?: ByteArray(0)
+                        val ctype = r.header("Content-Type") ?: ""
+                        val binary = o.optString("responseType") == "arraybuffer" ||
+                            !(ctype.startsWith("text/") || ctype.contains("json") || ctype.contains("xml"))
+                        val headerObj = JSONObject()
+                        r.headers.forEach { (k, v) -> headerObj.put(k.lowercase(), v) }
+                        dispatch(
+                            id, null, r.code, r.message, headerObj.toString(),
+                            Base64.encodeToString(bytes, Base64.NO_WRAP), binary
+                        )
+                    }
+                }
+            })
+        }
+
+        private fun dispatch(
+            id: Int, err: String?, status: Int, statusText: String,
+            headersJson: String, bodyB64: String, binary: Boolean
+        ) {
+            val js = "window.__lxHttpDone($id, ${err?.let { q(it) } ?: "null"}, $status, " +
+                "${q(statusText)}, ${q(headersJson)}, ${q(bodyB64)}, $binary)"
+            main.post { runCatching { web.evaluateJavascript(js, null) } }
+        }
+    }
 
     // ---------------- 取链（只解析不下载） ----------------
 
@@ -353,7 +310,7 @@ class Engine(
      */
     suspend fun resolveUrl(item: Track, quality: String): String = withContext(Dispatchers.IO) {
         UrlCache.get(item.platform, item.id, quality)?.let { return@withContext it }
-        // 预览不能无限等：最多 30 秒，超时就报错（LX 也会很快放弃）
+        // 预览不能无限等：最多 60 秒，超时就报错（LX 也会很快放弃）
         withTimeoutOrNull(60_000) { resolveUrlInner(item, quality) }
             ?: throw IllegalStateException("取链超时，换个音源试试")
     }
@@ -408,13 +365,9 @@ class Engine(
      * 下载线程一拿到任务就直接开跑，不用现场等链接。
      */
     internal suspend fun prepare(item: Track): Prepared? = withContext(Dispatchers.IO) {
-        // 元数据和取链同时打，省掉串行的一次 API 往返
-        val metaJob = async { mergeMeta(item) }
+        val meta = mergeMeta(item)
         val entries = orderedSources(item.platform)
-        if (entries.isEmpty()) {
-            metaJob.cancel()
-            return@withContext null
-        }
+        if (entries.isEmpty()) return@withContext null
         val candidates = mutableListOf<Candidate>()
         var active: SourceInfo? = null
         var supporting = 0
@@ -436,11 +389,10 @@ class Engine(
             if (unofficial) break
         }
         if (candidates.isEmpty()) {
-            metaJob.cancel()
             throw IllegalStateException(lastScriptError?.takeIf { it.isNotBlank() } ?: "所有音源都没拿到链接")
         }
         Prepared(
-            meta = metaJob.await(),
+            meta = meta,
             candidates = candidates.sortedWith(compareBy({ it.official }, { -qualityRank(it.quality) })),
             source = active
         )
@@ -568,7 +520,7 @@ class Engine(
         )
     }
 
-    /** 加载音源脚本；被取消时不要吞掉 CancellationException，其它错误记录原因后返回 null。 */
+    /** 加载音源脚本；被取消时不要吞掉 CancellationException，其它错误静默。 */
     private suspend fun loadSources(entry: SourceEntry): List<SourceInfo>? = try {
         loadScript(entry)
     } catch (e: kotlinx.coroutines.CancellationException) {
@@ -590,7 +542,7 @@ class Engine(
             return null
         }
         val url = extractUrl(v)
-        if (url == null) lastScriptError = "音源返回了无法识别的结果"
+        if (url == null) lastScriptError = "音源没有返回可用的直链（后端可能全都失败）"
         return url
     }
 

@@ -188,7 +188,15 @@
     if (err) { e = new Error(err); }
     else {
       var body = binary ? b64ToBytes(bodyB64 || '').buffer : dec.decode(b64ToBytes(bodyB64 || ''));
-      resp = { status: status, statusText: statusText, headers: JSON.parse(headersJson || '{}'), body: body, raw: body };
+      resp = {
+        statusCode: status,
+        statusMessage: statusText,
+        status: status,
+        statusText: statusText,
+        headers: JSON.parse(headersJson || '{}'),
+        body: body,
+        raw: body
+      };
     }
     try { cb(e, resp); } catch (x) { host.log('error', errText(x)); }
   };

@@ -13,6 +13,8 @@ import android.os.Looper
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import io.flutter.embedding.engine.plugins.FlutterPlugin
+import android.view.ViewGroup
+import android.webkit.WebView
 import io.flutter.embedding.engine.plugins.activity.ActivityAware
 import io.flutter.embedding.engine.plugins.activity.ActivityPluginBinding
 import io.flutter.plugin.common.MethodCall
@@ -156,21 +158,34 @@ class LxdlPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAware
         return http!!
     }
 
-    /** 预览/测速/复制直链用的独立引擎，避免和下载任务抢同一个脚本上下文。 */
-    private fun interactiveEngine(): Engine = synchronized(engines) {
-        interactive ?: createEngine().also { interactive = it }
+    /**
+     * 预览/测速/复制直链用的独立引擎，避免和下载任务抢同一个脚本上下文。
+     * WebView 只能在有 Looper 的线程（主线程）创建，所以这里强制切主线程。
+     */
+    private suspend fun interactiveEngine(): Engine = withContext(Dispatchers.Main.immediate) {
+        synchronized(engines) {
+            interactive ?: createEngine().also { interactive = it }
+        }
     }
 
-    private fun engineAt(index: Int): Engine = synchronized(engines) {
-        while (engines.size <= index) engines.add(createEngine())
-        engines[index]
+    private suspend fun engineAt(index: Int): Engine = withContext(Dispatchers.Main.immediate) {
+        synchronized(engines) {
+            while (engines.size <= index) engines.add(createEngine())
+            engines[index]
+        }
     }
 
-    /** QuickJS 引擎是纯内存对象，不需要 Activity/主线程。 */
     private fun createEngine(): Engine {
+        val act = activity ?: throw IllegalStateException("界面未就绪")
         val (r, p) = base()
-        val e = Engine(appCtx, r, h(), p)
+        val web = WebView(act)
+        web.isFocusable = false
+        val root = act.findViewById<ViewGroup>(android.R.id.content)
+            ?: throw IllegalStateException("找不到根视图")
+        root.addView(web, ViewGroup.LayoutParams(1, 1))
+        val e = Engine(act, r, h(), web, p)
         e.onLog = { sendEvent("log", it) }
+        e.start()
         return e
     }
 
@@ -404,7 +419,7 @@ class LxdlPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAware
                 }
             }
             "warmUp" -> {
-                // 提前把音源脚本跑起来，点下载时不用再等引擎冷启动
+                // 提前把 WebView + 音源脚本跑起来，点下载时不用再等引擎冷启动
                 scope.launch {
                     runCatching {
                         val entries = base().first.listSources()
@@ -546,7 +561,7 @@ class LxdlPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAware
         controlsLocal.forEach { (k, c) -> controls[k] = c }
         sendEvent("downloads")
 
-        // 槽位池：一个槽对应一个 JS 引擎，保证同时在跑的任务不会共用同一个脚本上下文
+        // 槽位池：一个槽对应一个 WebView 引擎，保证同时在跑的任务不会共用同一个脚本上下文
         val slots = Channel<Int>(n)
         repeat(n) { runCatching { slots.trySend(it) } }
 
