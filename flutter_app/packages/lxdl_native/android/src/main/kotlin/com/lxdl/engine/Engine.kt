@@ -26,7 +26,6 @@ import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
-import java.util.concurrent.atomic.AtomicReference
 
 data class SourceInfo(
     val key: String,
@@ -85,10 +84,11 @@ class Engine(
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val segmenter = SegmentDownloader(http)
-    private val qjs: QuickJs = QuickJs.create(Dispatchers.Default)
+    @Volatile private var qjs: QuickJs = QuickJs.create(Dispatchers.Default)
     private val evalLock = Mutex()
     private val startLock = Mutex()
-    private val inited = AtomicReference(CompletableDeferred<JSONObject>())
+    @Volatile private var initedPayload: JSONObject? = null
+    @Volatile private var initedError: String? = null
     private val pendingResults = ConcurrentHashMap<Int, CompletableDeferred<JSONObject>>()
     private val timerJobs = ConcurrentHashMap<Long, Job>()
     private val seq = AtomicInteger(1)
@@ -97,6 +97,19 @@ class Engine(
     private var loadedEntry: String? = null
     @Volatile private var started = false
     @Volatile private var closed = false
+
+    /**
+     * 卡死的运行时直接换一个：不 close（native 里可能还有卡住的 evaluate，close 有风险），
+     * 让它自生自灭，下次用新实例。
+     */
+    private fun abandonRuntime() {
+        val old = qjs
+        qjs = QuickJs.create(Dispatchers.Default)
+        started = false
+        initedPayload = null
+        initedError = null
+        scope.launch { runCatching { old.close() } }
+    }
 
     fun detach() {
         closed = true
@@ -152,17 +165,11 @@ class Engine(
                 val json = args.getOrNull(1)?.toString() ?: "{}"
                 val o = JSONObject(json)
                 when (name) {
-                    "inited" -> {
-                        val d = inited.get()
-                        if (!d.isCompleted) d.complete(o)
-                    }
+                    // 这里只记录，不唤醒任何协程：evaluate 还在跑的时候让别的协程恢复执行，
+                    // 会再发起一次 evaluate，和正在等待 async job 的这次撞上。
+                    "inited" -> initedPayload = o
                     "updateAlert" -> log("音源提示：" + o.optString("log"))
-                    "__inited_error" -> {
-                        val d = inited.get()
-                        if (!d.isCompleted) {
-                            d.completeExceptionally(IllegalStateException(o.optString("message")))
-                        }
-                    }
+                    "__inited_error" -> initedError = o.optString("message")
                     "__result" -> pendingResults.remove(o.optInt("id"))?.complete(o)
                 }
             }
@@ -274,23 +281,37 @@ class Engine(
     suspend fun loadScript(entry: SourceEntry): List<SourceInfo> = withContext(Dispatchers.IO) {
         if (loadedEntry == entry.file && activeSources.isNotEmpty()) return@withContext activeSources
         ensureStarted()
-        val fresh = CompletableDeferred<JSONObject>()
-        inited.set(fresh)
+        initedPayload = null
+        initedError = null
         val code = File(repo.sourcesDir, entry.file).readText()
         val meta = JSONObject().put("name", entry.name).put("version", entry.version)
             .put("author", entry.author).put("rawScript", code)
         eval("globalThis.__lxScriptInfo = ${meta};", "meta.js")
+        val evalStart = System.currentTimeMillis()
         try {
-            withTimeoutOrNull(25_000) { eval("(function () {\n" + code + "\n})();", entry.file) }
-                ?: throw IllegalStateException("音源脚本执行超时")
+            withTimeoutOrNull(60_000) { eval("(function () {\n" + code + "\n})();", entry.file) }
+                ?: throw IllegalStateException(
+                    "音源脚本执行超时（60s，脚本 ${code.length} 字符，来自 ${entry.file}）"
+                )
+        } catch (e: IllegalStateException) {
+            // 超时：运行时多半卡住了，换一个新的，别让后续任务继续等它
+            android.util.Log.w("lxdl-js", "script eval timeout after ${System.currentTimeMillis() - evalStart}ms")
+            abandonRuntime()
+            throw e
         } catch (e: Throwable) {
-            if (!fresh.isCompleted) {
-                fresh.completeExceptionally(IllegalStateException(e.message ?: "脚本执行失败"))
-            }
+            android.util.Log.w("lxdl-js", "script eval failed after ${System.currentTimeMillis() - evalStart}ms: ${e.message}")
             throw IllegalStateException("音源脚本执行失败：${e.message}")
         }
-        val info = withTimeoutOrNull(25_000) { fresh.await() }
-            ?: throw IllegalStateException("音源初始化超时")
+        android.util.Log.i("lxdl-js", "script ${entry.file} eval ${System.currentTimeMillis() - evalStart}ms")
+
+        // 轮询等脚本上报 inited（不在这里 await 一个 deferred，避免唤醒重入）
+        val deadline = System.currentTimeMillis() + 30_000
+        while (initedPayload == null && initedError == null && System.currentTimeMillis() < deadline) {
+            delay(10)
+        }
+        val scriptErr = initedError
+        if (scriptErr != null) throw IllegalStateException("音源初始化失败：$scriptErr")
+        val info = initedPayload ?: throw IllegalStateException("音源初始化超时（脚本没有上报 inited）")
         activeSources = parseSources(info)
         repo.notePlatforms(entry.file, activeSources.map { it.key })
         loadedEntry = entry.file
