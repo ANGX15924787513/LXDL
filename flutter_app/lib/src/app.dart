@@ -94,6 +94,8 @@ class _LxdlAppState extends State<LxdlApp> with WidgetsBindingObserver {
   final ValueNotifier<int> _audioStop = ValueNotifier(0);
   // 当前选中歌曲的封面，用作整屏模糊背景
   final ValueNotifier<String?> _cover = ValueNotifier(null);
+  // 试听播放进度（pos/dur/playing），由原生每 500ms 推一次
+  final ValueNotifier<Map<String, dynamic>?> _previewState = ValueNotifier(null);
   // 主题色（可在「音源」页设置里改）
   final ValueNotifier<Color> _seed = ValueNotifier(_defaultSeed);
   final GlobalKey<ScaffoldMessengerState> _scaffold = GlobalKey();
@@ -110,6 +112,8 @@ class _LxdlAppState extends State<LxdlApp> with WidgetsBindingObserver {
       } else if (type == 'share') {
         _shareIn.value = data['text'] as String? ?? '';
         setState(() => _tab = 0);
+      } else if (type == 'preview') {
+        _previewState.value = data;
       } else if (type == 'log') {
         final text = data['text'] as String? ?? '';
         if (text.isEmpty) return;
@@ -213,6 +217,7 @@ class _LxdlAppState extends State<LxdlApp> with WidgetsBindingObserver {
                                       shareIn: _shareIn,
                                       audioStop: _audioStop,
                                       coverIn: _cover,
+                                      previewState: _previewState,
                                       onStarted: () {
                                         _stopAudio();
                                         setState(() => _tab = 1);

@@ -37,6 +37,8 @@ class SearchPage extends StatefulWidget {
   final ValueNotifier<int> audioStop;
   /// 当前选中歌曲的封面，交给 App 当模糊背景
   final ValueNotifier<String?> coverIn;
+  /// 试听进度（pos/dur/playing）
+  final ValueNotifier<Map<String, dynamic>?> previewState;
   final VoidCallback onStarted;
   const SearchPage({
     super.key,
@@ -44,6 +46,7 @@ class SearchPage extends StatefulWidget {
     required this.shareIn,
     required this.audioStop,
     required this.coverIn,
+    required this.previewState,
     required this.onStarted,
   });
 
@@ -61,6 +64,9 @@ class _SearchPageState extends State<SearchPage> {
   List<Map<String, dynamic>> _results = [];
   int _selected = -1;
   Map<String, dynamic>? _preview;
+  double _posMs = 0;
+  double _durMs = 0;
+  double? _dragMs;
   static bool _warmed = false;
   int _quality = 0;
   int _namingIndex = 0;
@@ -77,12 +83,14 @@ class _SearchPageState extends State<SearchPage> {
     _loadConfig();
     widget.shareIn.addListener(_onShare);
     widget.audioStop.addListener(_onAudioStop);
+    widget.previewState.addListener(_onPlayback);
   }
 
   @override
   void dispose() {
     widget.shareIn.removeListener(_onShare);
     widget.audioStop.removeListener(_onAudioStop);
+    widget.previewState.removeListener(_onPlayback);
     // 页面被销毁时别让声音继续放
     Bridge.call('stopPreview').then((_) {}, onError: (_) {});
     widget.coverIn.value = null;
@@ -91,8 +99,48 @@ class _SearchPageState extends State<SearchPage> {
 
   /// 外部（切 tab / 切后台 / 开始下载）停了音频，这里只复位按钮状态
   void _onAudioStop() {
-    if (!_playing) return;
-    setState(() => _playing = false);
+    if (!_playing && _durMs == 0) return;
+    setState(() {
+      _playing = false;
+      _posMs = 0;
+      _durMs = 0;
+      _dragMs = null;
+    });
+  }
+
+  /// 原生推上来的播放进度
+  void _onPlayback() {
+    final d = widget.previewState.value;
+    if (d == null || !mounted) return;
+    final pos = (d['pos'] as num?)?.toDouble() ?? 0;
+    final dur = (d['dur'] as num?)?.toDouble() ?? 0;
+    final playing = d['playing'] == true;
+    setState(() {
+      if (dur > 0) {
+        _durMs = dur;
+        _posMs = pos;
+      }
+      if (!playing && dur > 0 && pos >= dur - 300) {
+        _playing = false;
+        _dragMs = null;
+      }
+    });
+  }
+
+  /// 歌单结果/歌单模式下不给试听
+  bool get _canPreview {
+    final t = _preview;
+    if (t == null) return false;
+    if (t['playlist'] == true) return false;
+    if (_mode == 0 && _kind == 1) return false;
+    return true;
+  }
+
+  String _fmt(double ms) {
+    final total = (ms / 1000).round();
+    final m = total ~/ 60;
+    final s = (total % 60).toString().padLeft(2, '0');
+    return '$m:$s';
   }
 
   void _onShare() {
@@ -275,6 +323,9 @@ class _SearchPageState extends State<SearchPage> {
   Future<void> _stopPreview() async {
     // 注意：不能用 _playing 当守卫，否则「点停止」时已经先置 false 就停不掉了
     _playing = false;
+    _posMs = 0;
+    _durMs = 0;
+    _dragMs = null;
     try {
       await Bridge.call('stopPreview');
     } catch (_) {}
@@ -298,7 +349,14 @@ class _SearchPageState extends State<SearchPage> {
         'url': url,
         'platform': t['platform'] ?? '',
       });
-      if (mounted) setState(() => _playing = true);
+      if (mounted) {
+        setState(() {
+          _playing = true;
+          _posMs = 0;
+          _durMs = 0;
+          _dragMs = null;
+        });
+      }
     } catch (e) {
       if (mounted) setState(() => _error = '试听失败：${Bridge.err(e)}');
     } finally {
@@ -514,7 +572,10 @@ class _SearchPageState extends State<SearchPage> {
                       DropdownMenuItem(value: 0, child: Text('歌曲')),
                       DropdownMenuItem(value: 1, child: Text('歌单')),
                     ],
-                    onChanged: (v) => setState(() => _kind = v ?? 0),
+                    onChanged: (v) {
+                      setState(() => _kind = v ?? 0);
+                      _stopPreview();
+                    },
                   ),
                 ),
               ),
@@ -692,12 +753,37 @@ class _SearchPageState extends State<SearchPage> {
                 Text('${t['meta'] ?? ''}', style: Theme.of(context).textTheme.bodySmall),
               ]),
             ),
-            IconButton.filledTonal(
-              tooltip: _playing ? '停止试听' : '试听',
-              onPressed: _busy ? null : _togglePreview,
-              icon: Icon(_playing ? Icons.stop_circle_outlined : Icons.play_arrow_rounded),
-            ),
+            if (_canPreview)
+              IconButton.filledTonal(
+                tooltip: _playing ? '停止试听' : '试听',
+                onPressed: _busy ? null : _togglePreview,
+                icon: Icon(_playing ? Icons.stop_circle_outlined : Icons.play_arrow_rounded),
+              ),
           ]),
+          if (_playing && _durMs > 0)
+            Row(children: [
+              Text(_fmt(_dragMs ?? _posMs), style: Theme.of(context).textTheme.labelSmall),
+              Expanded(
+                child: SliderTheme(
+                  data: SliderTheme.of(context).copyWith(
+                    trackHeight: 3,
+                    thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
+                    overlayShape: const RoundSliderOverlayShape(overlayRadius: 12),
+                  ),
+                  child: Slider(
+                    value: (_dragMs ?? _posMs).clamp(0.0, _durMs).toDouble(),
+                    max: _durMs,
+                    onChanged: (v) => setState(() => _dragMs = v),
+                    onChangeEnd: (v) {
+                      setState(() => _dragMs = null);
+                      Bridge.call('seekPreview', {'ms': v.round()})
+                          .then((_) {}, onError: (_) {});
+                    },
+                  ),
+                ),
+              ),
+              Text(_fmt(_durMs), style: Theme.of(context).textTheme.labelSmall),
+            ]),
           const SizedBox(height: 8),
           Row(children: [
             Expanded(

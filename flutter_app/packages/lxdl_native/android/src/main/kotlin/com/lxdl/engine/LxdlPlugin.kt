@@ -21,8 +21,11 @@ import io.flutter.plugin.common.PluginRegistry
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -51,6 +54,7 @@ class LxdlPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAware
     private var interactive: Engine? = null
     private val controls = ConcurrentHashMap<Int, DownloadControl>()
     private var player: MediaPlayer? = null
+    private var previewTicker: Job? = null
     private var pendingShare: String? = null
 
     // ---------------- 生命周期 ----------------
@@ -179,6 +183,11 @@ class LxdlPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAware
                 o.put("value", data.getOrNull(1))
             }
             "share" -> o.put("text", data.getOrNull(0)?.toString() ?: "")
+            "preview" -> {
+                o.put("pos", data.getOrNull(0))
+                o.put("dur", data.getOrNull(1))
+                o.put("playing", data.getOrNull(2))
+            }
         }
         main.post { runCatching { channel.invokeMethod("event", o.toString()) } }
     }
@@ -422,6 +431,10 @@ class LxdlPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAware
                         .onSuccess { reply(result, it) }
                         .onFailure { fail(result, it) }
                 }
+            }
+            "seekPreview" -> {
+                val ms = (call.argument<Int>("ms") ?: 0).toLong()
+                reply(result, seekPreview(ms))
             }
             "stopPreview" -> {
                 stopPreview()
@@ -683,9 +696,15 @@ class LxdlPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAware
             player = MediaPlayer().apply {
                 setOnPreparedListener {
                     it.start()
+                    startPreviewTicker()
                     if (!done.isCompleted) done.complete(true)
                 }
-                setOnCompletionListener { if (!done.isCompleted) done.complete(true) }
+                setOnCompletionListener { mp ->
+                    if (!done.isCompleted) done.complete(true)
+                    runCatching {
+                        sendEvent("preview", mp.duration.toLong(), mp.duration.toLong(), false)
+                    }
+                }
                 setOnErrorListener { _, what, extra ->
                     if (!done.isCompleted) {
                         done.completeExceptionally(IllegalStateException("播放器报错 $what/$extra"))
@@ -717,10 +736,38 @@ class LxdlPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAware
         "Referer" to refererOf(platform)
     )
 
+    private fun startPreviewTicker() {
+        previewTicker?.cancel()
+        previewTicker = scope.launch {
+            while (isActive) {
+                val snapshot = withContext(Dispatchers.Main.immediate) {
+                    val p = player
+                    if (p == null) null
+                    else runCatching {
+                        Triple(p.currentPosition.toLong(), p.duration.toLong(), p.isPlaying)
+                    }.getOrNull()
+                } ?: break
+                sendEvent("preview", snapshot.first, snapshot.second, snapshot.third)
+                if (!snapshot.third && snapshot.second > 0 && snapshot.first >= snapshot.second - 300) break
+                delay(500)
+            }
+        }
+    }
+
+    private fun seekPreview(ms: Long): Boolean = runCatching {
+        main.post {
+            runCatching { player?.seekTo(ms.toInt().coerceAtLeast(0)) }
+        }
+        true
+    }.getOrDefault(false)
+
     private fun stopPreview() {
+        previewTicker?.cancel()
+        previewTicker = null
         main.post {
             runCatching { player?.release() }
             player = null
+            sendEvent("preview", 0L, 0L, false)
         }
     }
 

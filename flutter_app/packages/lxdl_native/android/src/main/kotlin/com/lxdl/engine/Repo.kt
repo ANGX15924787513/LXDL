@@ -15,6 +15,8 @@ data class Cfg(
     var naming: String = "{title} - {artist}",
     var outDir: String = "lxdl",
     var theme: String = "#3A7AF0",
+    /** 已随包内置的音源版本（空 = 还没导入过） */
+    var builtinSourceVersion: String = "",
     var lyrics: Boolean = true,
     var lrcSidecar: Boolean = false,
     var concurrency: Int = 1,
@@ -30,6 +32,7 @@ data class Cfg(
         .put("naming", naming)
         .put("outDir", outDir)
         .put("theme", theme)
+        .put("builtinSourceVersion", builtinSourceVersion)
         .put("lyrics", lyrics)
         .put("lrcSidecar", lrcSidecar)
         .put("concurrency", concurrency)
@@ -54,6 +57,7 @@ data class Cfg(
                 naming = o.optString("naming", "{title} - {artist}"),
                 outDir = o.optString("outDir", "lxdl"),
                 theme = o.optString("theme", "#3A7AF0"),
+                builtinSourceVersion = o.optString("builtinSourceVersion", ""),
                 lyrics = o.optBoolean("lyrics", true),
                 lrcSidecar = o.optBoolean("lrcSidecar", false),
                 concurrency = o.optInt("concurrency", 1).coerceIn(1, 3),
@@ -137,34 +141,40 @@ class Repo(val ctx: Context) {
         sourcesCache = null
     }
 
-    fun listSources(): List<SourceEntry> {
-        sourcesCache?.let { return it }
-        val files = sourcesDir.listFiles { f -> f.isFile && f.name.endsWith(".js") } ?: return emptyList()
-        val list = files.map { f ->
-            val text = runCatching { f.readText() }.getOrDefault("")
-            val name = Regex("@name\\s+(.+)").find(text)?.groupValues?.get(1)?.trim() ?: f.nameWithoutExtension
-            val version = Regex("@version\\s+(.+)").find(text)?.groupValues?.get(1)?.trim() ?: ""
-            val author = Regex("@author\\s+(.+)").find(text)?.groupValues?.get(1)?.trim() ?: ""
-            SourceEntry(name, f.name, version, author)
-        }.toMutableList()
-        val order = cfg.order
-        list.sortBy { e ->
-            val i = order.indexOf(e.name)
-            if (i < 0) Int.MAX_VALUE else i
+    // 随包音源：进程内只读一次
+    private val builtinSource: String? by lazy {
+        runCatching {
+            ctx.assets.open("lx_source.js").bufferedReader().use { it.readText() }
+        }.getOrNull()
+    }
+    private val builtinVersion: String by lazy {
+        Regex("@version\\s+(.+)").find(builtinSource ?: "")
+            ?.groupValues?.get(1)?.trim() ?: ""
+    }
+
+    /**
+     * 随包内置一个音源：首次运行（或内置版本变了）时把 assets/lx_source.js 写进 sources 目录。
+     * 用户删掉后，下次 App 升级带了新版本会再出现。
+     */
+    private fun ensureBuiltinSource() {
+        val text = builtinSource ?: return
+        if (text.isBlank()) return
+        if (builtinVersion.isNotEmpty() && builtinVersion == cfg.builtinSourceVersion) return
+
+        synchronized(lock) {
+            if (builtinVersion.isNotEmpty() && builtinVersion == cfg.builtinSourceVersion) return
+            runCatching {
+                val name = Regex("@name\\s+(.+)").find(text)
+                    ?.groupValues?.get(1)?.trim() ?: "内置音源"
+                val safe = name.replace(Regex("[\\\\/:*?\"<>|]"), "_").take(48)
+                File(sourcesDir, safe + ".js").writeText(text)
+                if (!cfg.order.contains(name)) cfg.order.add(name)
+                cfg.builtinSourceVersion = builtinVersion
+                saveCfg()
+                invalidateSources()
+            }
         }
-        val result: List<SourceEntry> = list.toList()
-        sourcesCache = result
-        return result
     }
-
-    // 本次运行里学到的「音源 -> 支持平台」，用来跳过不可能命中的脚本
-    private val sourcePlatforms = java.util.concurrent.ConcurrentHashMap<String, List<String>>()
-
-    fun notePlatforms(file: String, platforms: List<String>) {
-        sourcePlatforms[file] = platforms
-    }
-
-    fun knownPlatforms(file: String): List<String>? = sourcePlatforms[file]
 
     fun importSource(input: String, http: Http): SourceEntry {
         val text = if (input.trim().startsWith("http")) http.text(input.trim(), timeoutMs = 60_000) else input
