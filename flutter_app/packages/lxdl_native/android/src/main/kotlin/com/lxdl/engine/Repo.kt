@@ -60,7 +60,7 @@ data class Cfg(
                 builtinSourceVersion = o.optString("builtinSourceVersion", ""),
                 lyrics = o.optBoolean("lyrics", true),
                 lrcSidecar = o.optBoolean("lrcSidecar", false),
-                concurrency = o.optInt("concurrency", 1).coerceIn(1, 3),
+                concurrency = o.optInt("concurrency", 1).coerceIn(1, 8),
                 wifiOnly = o.optBoolean("wifiOnly", true),
                 outTree = o.optString("outTree", ""),
                 history = list("history")
@@ -175,6 +175,36 @@ class Repo(val ctx: Context) {
             }
         }
     }
+
+    fun listSources(): List<SourceEntry> {
+        ensureBuiltinSource()
+        sourcesCache?.let { return it }
+        val files = sourcesDir.listFiles { f -> f.isFile && f.name.endsWith(".js") } ?: return emptyList()
+        val list = files.map { f ->
+            val text = runCatching { f.readText() }.getOrDefault("")
+            val name = Regex("@name\\s+(.+)").find(text)?.groupValues?.get(1)?.trim() ?: f.nameWithoutExtension
+            val version = Regex("@version\\s+(.+)").find(text)?.groupValues?.get(1)?.trim() ?: ""
+            val author = Regex("@author\\s+(.+)").find(text)?.groupValues?.get(1)?.trim() ?: ""
+            SourceEntry(name, f.name, version, author)
+        }.toMutableList()
+        val order = cfg.order
+        list.sortBy { e ->
+            val i = order.indexOf(e.name)
+            if (i < 0) Int.MAX_VALUE else i
+        }
+        val result: List<SourceEntry> = list.toList()
+        sourcesCache = result
+        return result
+    }
+
+    // 本次运行里学到的「音源 -> 支持平台」，用来跳过不可能命中的脚本
+    private val sourcePlatforms = java.util.concurrent.ConcurrentHashMap<String, List<String>>()
+
+    fun notePlatforms(file: String, platforms: List<String>) {
+        sourcePlatforms[file] = platforms
+    }
+
+    fun knownPlatforms(file: String): List<String>? = sourcePlatforms[file]
 
     fun importSource(input: String, http: Http): SourceEntry {
         val text = if (input.trim().startsWith("http")) http.text(input.trim(), timeoutMs = 60_000) else input

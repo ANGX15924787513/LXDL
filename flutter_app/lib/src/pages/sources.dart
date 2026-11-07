@@ -297,12 +297,11 @@ class _SourcesPageState extends State<SourcesPage> {
             const SizedBox(width: 8),
             DropdownButtonHideUnderline(
               child: DropdownButton<int>(
-                value: _concurrency.clamp(1, 3).toInt(),
+                value: _concurrency.clamp(1, 8).toInt(),
                 isDense: true,
-                items: const [
-                  DropdownMenuItem(value: 1, child: Text('1')),
-                  DropdownMenuItem(value: 2, child: Text('2')),
-                  DropdownMenuItem(value: 3, child: Text('3')),
+                items: [
+                  for (var i = 1; i <= 8; i++)
+                    DropdownMenuItem(value: i, child: Text('$i')),
                 ],
                 onChanged: (v) {
                   setState(() => _concurrency = v ?? 1);

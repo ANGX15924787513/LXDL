@@ -224,7 +224,7 @@ class LxdlPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAware
                 r.cfg.theme = o.optString("theme", r.cfg.theme)
                 r.cfg.lyrics = o.optBoolean("lyrics", r.cfg.lyrics)
                 r.cfg.lrcSidecar = o.optBoolean("lrcSidecar", r.cfg.lrcSidecar)
-                r.cfg.concurrency = o.optInt("concurrency", r.cfg.concurrency).coerceIn(1, 3)
+                r.cfg.concurrency = o.optInt("concurrency", r.cfg.concurrency).coerceIn(1, 8)
                 r.cfg.wifiOnly = o.optBoolean("wifiOnly", r.cfg.wifiOnly)
                 r.cfg.outTree = o.optString("outTree", r.cfg.outTree)
                 r.saveCfg()
@@ -539,7 +539,7 @@ class LxdlPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAware
             sendEvent("log", "当前不是 Wi-Fi，已跳过（可关闭「仅 Wi-Fi」）")
             return
         }
-        val n = r.cfg.concurrency.coerceIn(1, 3)
+        val n = r.cfg.concurrency.coerceIn(1, 8)
         // 先把任务全部登记出来，列表立刻可见、随时可取消
         val items = tracks.map { r.addItem(it) }
         val controlsLocal = items.associate { it.key to DownloadControl() }
