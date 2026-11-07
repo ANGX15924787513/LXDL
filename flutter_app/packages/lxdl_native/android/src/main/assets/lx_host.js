@@ -238,7 +238,10 @@
   function makeResponse(raw) {
     var r = JSON.parse(raw);
     var body = r.binary ? b64ToBytes(r.body).buffer : dec.decode(b64ToBytes(r.body));
+    // LX 的响应对象用的是 statusCode / statusMessage
     return {
+      statusCode: r.status,
+      statusMessage: r.statusText || '',
       status: r.status,
       statusText: r.statusText || '',
       headers: r.headers || {},

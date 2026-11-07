@@ -93,6 +93,7 @@ class Engine(
     private val timerJobs = ConcurrentHashMap<Long, Job>()
     private val seq = AtomicInteger(1)
     private var activeSources: List<SourceInfo> = emptyList()
+    @Volatile private var lastScriptError: String? = null
     private var loadedEntry: String? = null
     @Volatile private var started = false
     @Volatile private var closed = false
@@ -332,7 +333,7 @@ class Engine(
     suspend fun resolveUrl(item: Track, quality: String): String = withContext(Dispatchers.IO) {
         UrlCache.get(item.platform, item.id, quality)?.let { return@withContext it }
         // 预览不能无限等：最多 30 秒，超时就报错（LX 也会很快放弃）
-        withTimeoutOrNull(30_000) { resolveUrlInner(item, quality) }
+        withTimeoutOrNull(60_000) { resolveUrlInner(item, quality) }
             ?: throw IllegalStateException("取链超时，换个音源试试")
     }
 
@@ -349,7 +350,7 @@ class Engine(
                 return url
             }
         }
-        throw IllegalStateException("音源不可用：所有音源都没拿到链接")
+        throw IllegalStateException(lastScriptError?.takeIf { it.isNotBlank() } ?: "所有音源都没拿到链接")
     }
 
     /** 已加载的音源优先、已知支持该平台的优先、已知不支持的排最后。 */
@@ -415,7 +416,7 @@ class Engine(
         }
         if (candidates.isEmpty()) {
             metaJob.cancel()
-            return@withContext null
+            throw IllegalStateException(lastScriptError?.takeIf { it.isNotBlank() } ?: "所有音源都没拿到链接")
         }
         Prepared(
             meta = metaJob.await(),
@@ -546,26 +547,30 @@ class Engine(
         )
     }
 
-    /** 加载音源脚本；被取消时不要吞掉 CancellationException，其它错误静默。 */
+    /** 加载音源脚本；被取消时不要吞掉 CancellationException，其它错误记录原因后返回 null。 */
     private suspend fun loadSources(entry: SourceEntry): List<SourceInfo>? = try {
         loadScript(entry)
     } catch (e: kotlinx.coroutines.CancellationException) {
         throw e
     } catch (e: Throwable) {
+        lastScriptError = "${entry.name}：${e.message}"
         null
     }
 
-    /** 向音源要直链；失败静默返回 null。 */
+    /** 向音源要直链；失败记录原因后返回 null。 */
     private suspend fun musicUrl(item: Track, quality: String): String? {
         val info = JSONObject().put("type", quality).put("musicInfo", musicInfo(item))
         val v = try {
-            call(item.platform, "musicUrl", info, 25_000)
+            call(item.platform, "musicUrl", info, 40_000)
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
         } catch (e: Throwable) {
+            lastScriptError = e.message
             return null
         }
-        return extractUrl(v)
+        val url = extractUrl(v)
+        if (url == null) lastScriptError = "音源返回了无法识别的结果"
+        return url
     }
 
     private fun musicInfo(item: Track): JSONObject = JSONObject()
@@ -600,12 +605,16 @@ class Engine(
             .any { host.contains(it) }
     }
 
+    /** 网易云那个 outer/url 兜底链接现在固定 302 到 /404，当无效处理。 */
+    private fun isPlaceholderUrl(url: String): Boolean =
+        url.contains("/song/media/outer/url") || url.endsWith("/404")
+
     private fun extractUrl(v: Any?): String? = when (v) {
         is String -> v.trim().ifEmpty { null }
         is JSONObject -> listOf("url", "data", "src", "link", "musicUrl")
             .firstNotNullOfOrNull { k -> v.optString(k).ifBlank { null } }
         else -> null
-    }?.takeIf { it.startsWith("http") }
+    }?.takeIf { it.startsWith("http") && !isPlaceholderUrl(it) }
 
     private suspend fun fetchCover(item: Track, si: SourceInfo?, fallbackUrl: String?): ByteArray? {
         var url: String? = null

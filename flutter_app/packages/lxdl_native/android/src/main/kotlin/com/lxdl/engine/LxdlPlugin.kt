@@ -540,6 +540,7 @@ class LxdlPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAware
         // 批量时另开一条车道预取直链：链接比下载快得多，下载线程永不等链接
         val prefetch = tracks.size > 2
         val ready = ConcurrentHashMap<Int, CompletableDeferred<Prepared?>>()
+        val prefetchErrors = ConcurrentHashMap<Int, String>()
         if (prefetch) {
             items.indices.forEach { ready[it] = CompletableDeferred() }
             scope.launch {
@@ -551,7 +552,14 @@ class LxdlPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAware
                             ready[i]?.complete(null)
                             return@forEachIndexed
                         }
-                        val p = runCatching { eng.prepare(t) }.getOrNull()
+                        val p = try {
+                            eng.prepare(t)
+                        } catch (e: kotlinx.coroutines.CancellationException) {
+                            throw e
+                        } catch (e: Throwable) {
+                            prefetchErrors[i] = e.message ?: "取链失败"
+                            null
+                        }
                         ready[i]?.complete(p)
                     }
                 }.onFailure {
@@ -565,7 +573,10 @@ class LxdlPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAware
                 val worker = slots.receive()
                 try {
                     val prepared = if (prefetch) ready[i]?.await() else null
-                    downloadOne(t, items[i], controlsLocal[items[i].key]!!, worker, prepared)
+                    downloadOne(
+                        t, items[i], controlsLocal[items[i].key]!!, worker,
+                        prepared, prefetchErrors[i]
+                    )
                 } finally {
                     runCatching { slots.trySend(worker) }
                 }
@@ -585,12 +596,22 @@ class LxdlPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAware
         control: DownloadControl,
         worker: Int,
         prepared: Prepared?,
+        prefetchError: String?,
     ) {
         val (r, _) = base()
         if (control.cancelled) {
             r.fail(item.key, "已取消")
             controls.remove(item.key)
             sendEvent("downloads")
+            return
+        }
+        if (prepared == null && prefetchError != null) {
+            // 预取已经失败过了，别再花几十秒重试一次
+            r.fail(item.key, prefetchError)
+            sendEvent("log", "失败：$prefetchError")
+            controls.remove(item.key)
+            sendEvent("downloads")
+            if (controls.isEmpty()) Notifier.stop(appCtx)
             return
         }
         runCatching { Notifier.start(appCtx, t.title) }
