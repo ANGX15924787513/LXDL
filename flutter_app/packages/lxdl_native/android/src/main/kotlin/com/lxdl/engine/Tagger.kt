@@ -24,7 +24,6 @@ object Tagger {
         if (album.isNotBlank()) tag.setField(FieldKey.ALBUM, album)
         if (albumArtist.isNotBlank()) tag.setField(FieldKey.ALBUM_ARTIST, albumArtist)
         if (!lyrics.isNullOrBlank()) tag.setField(FieldKey.LYRICS, lyrics)
-        tag.setField(FieldKey.COMMENT, "洛雪音源 · lxdl")
         if (cover != null && cover.isNotEmpty()) {
             // 封面失败不影响文字标签
             runCatching {

@@ -15,6 +15,8 @@ data class Cfg(
     var naming: String = "{title} - {artist}",
     var outDir: String = "lxdl",
     var theme: String = "#3A7AF0",
+    /** 脚本引擎：webview（默认）/ quickjs */
+    var engine: String = "webview",
     /** 已随包内置的音源版本（空 = 还没导入过） */
     var builtinSourceVersion: String = "",
     var lyrics: Boolean = true,
@@ -32,6 +34,7 @@ data class Cfg(
         .put("naming", naming)
         .put("outDir", outDir)
         .put("theme", theme)
+        .put("engine", engine)
         .put("builtinSourceVersion", builtinSourceVersion)
         .put("lyrics", lyrics)
         .put("lrcSidecar", lrcSidecar)
@@ -57,6 +60,7 @@ data class Cfg(
                 naming = o.optString("naming", "{title} - {artist}"),
                 outDir = o.optString("outDir", "lxdl"),
                 theme = o.optString("theme", "#3A7AF0"),
+                engine = o.optString("engine", "webview").let { if (it == "quickjs") "quickjs" else "webview" },
                 builtinSourceVersion = o.optString("builtinSourceVersion", ""),
                 lyrics = o.optBoolean("lyrics", true),
                 lrcSidecar = o.optBoolean("lrcSidecar", false),

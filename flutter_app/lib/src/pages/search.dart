@@ -8,7 +8,18 @@ import '../ui.dart';
 
 const _platforms = ['wy', 'tx', 'kg', 'kw', 'mg'];
 const _platformLabels = ['网易云', 'QQ音乐', '酷狗', '酷我', '咪咕'];
-const _qualities = ['320k', '128k', 'flac', 'flac24bit'];
+const _defaultQualities = ['320k', '128k', 'flac', 'flac24bit'];
+const _qualityLabels = <String, String>{
+  '128k': '128k',
+  '192k': '192k',
+  '320k': '320k',
+  'flac': 'FLAC',
+  'flac24bit': 'FLAC 24bit',
+  'hires': 'Hi-Res',
+  'atmos': 'Atmos',
+  'atmos_plus': 'Atmos+',
+  'master': '母带',
+};
 const _naming = [
   ('歌名 - 歌手', '{title} - {artist}'),
   ('歌手 - 歌名', '{artist} - {title}'),
@@ -69,6 +80,8 @@ class _SearchPageState extends State<SearchPage> {
   double? _dragMs;
   static bool _warmed = false;
   int _quality = 0;
+  List<String> _qualities = List.of(_defaultQualities);
+  String _preferredQuality = '320k';
   int _namingIndex = 0;
   String _customTemplate = '{title} - {artist}';
   bool _lyrics = true;
@@ -127,6 +140,23 @@ class _SearchPageState extends State<SearchPage> {
     });
   }
 
+  /// 只列这首歌所在平台真正支持的音质
+  Future<void> _loadQualities(String platform) async {
+    if (platform.isEmpty) return;
+    try {
+      final raw = await Bridge.call('qualities', {'platform': platform}) as String?;
+      final list = (jsonDecode(raw ?? '[]') as List).cast<String>();
+      if (list.isEmpty || !mounted) return;
+      setState(() {
+        _qualities = list;
+        final i = list.indexOf(_preferredQuality);
+        _quality = i >= 0 ? i : 0;
+      });
+    } catch (_) {}
+  }
+
+  String _qualityLabel(String key) => _qualityLabels[key] ?? key;
+
   /// 歌单结果/歌单模式下不给试听
   bool get _canPreview {
     final t = _preview;
@@ -165,8 +195,8 @@ class _SearchPageState extends State<SearchPage> {
         _dir.text = cfg['outDir'] as String? ?? 'lxdl';
         _lyrics = cfg['lyrics'] as bool? ?? true;
         _history = ((cfg['history'] as List?) ?? []).cast<String>();
-        final q = cfg['quality'] as String? ?? '320k';
-        _quality = _qualities.indexOf(q).clamp(0, 3).toInt();
+        _preferredQuality = cfg['quality'] as String? ?? '320k';
+        _quality = _qualities.indexOf(_preferredQuality).clamp(0, _qualities.length - 1).toInt();
         final n = cfg['naming'] as String? ?? _naming[0].$2;
         final idx = _naming.indexWhere((e) => e.$2 == n);
         if (idx >= 0) {
@@ -270,6 +300,7 @@ class _SearchPageState extends State<SearchPage> {
         _preview = t;
       });
       widget.coverIn.value = t['cover'] as String?;
+      _loadQualities(t['platform'] as String? ?? '');
       _warmUp();
       await _refreshMirror();
     } catch (e) {
@@ -298,6 +329,8 @@ class _SearchPageState extends State<SearchPage> {
     });
     widget.coverIn.value = _results[i]['cover'] as String?;
     final t = _results[i];
+    final plat = t['platform'] as String? ?? '';
+    if (plat.isNotEmpty) _loadQualities(plat);
     if (t['playlist'] == true) return;
     try {
       final raw = await Bridge.call('detail', {
@@ -588,7 +621,7 @@ class _SearchPageState extends State<SearchPage> {
             Expanded(
               child: TextField(
                 controller: _keyword,
-                decoration: const InputDecoration(hintText: '关键词'),
+                decoration: const InputDecoration(hintText: '搜索......'),
                 onSubmitted: (_) => _search(),
               ),
             ),
@@ -677,7 +710,12 @@ class _SearchPageState extends State<SearchPage> {
                             shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
                             selectedTileColor: scheme.secondaryContainer.withValues(alpha: 0.75),
                             contentPadding: const EdgeInsets.symmetric(horizontal: 12),
-                            title: Text('${t['title'] ?? ''}', maxLines: 1, overflow: TextOverflow.ellipsis),
+                            title: Text(
+                              '${t['title'] ?? ''}',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(fontWeight: FontWeight.w800),
+                            ),
                             subtitle: Text(
                               '${t['artist'] ?? ''}   ${t['meta'] ?? ''}',
                               maxLines: 1,
@@ -720,6 +758,38 @@ class _SearchPageState extends State<SearchPage> {
     Bridge.call('warmUp').then((_) {}, onError: (_) {});
   }
 
+  /// 长按封面 → 询问是否单独保存
+  Future<void> _askSaveCover(Map<String, dynamic> t) async {
+    final cover = (t['cover'] as String?)?.trim() ?? '';
+    if (cover.isEmpty) return;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        content: const Text('保存这首歌的封面？'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('不')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('保存封面')),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    try {
+      final where = await Bridge.call('saveCover', {
+        'url': cover,
+        'name': '${t['title'] ?? 'cover'}',
+      }) as String?;
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('封面已保存：${where ?? ''}')),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('保存封面失败：${Bridge.err(e)}')),
+      );
+    }
+  }
+
   /// 下拉框也包成一个圆角“输入框”，和 TextField 观感统一
   Widget _fieldBox({required Widget child}) {
     return Container(
@@ -739,14 +809,19 @@ class _SearchPageState extends State<SearchPage> {
         padding: const EdgeInsets.all(10),
         child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
           Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            _CoverArt(url: cover, size: 84, gap: 10),
+            _CoverArt(
+              url: cover,
+              size: 84,
+              gap: 10,
+              onLongPress: () => _askSaveCover(t),
+            ),
             Expanded(
               child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                 Text(
                   '${t['title'] ?? ''}',
                   maxLines: 2,
                   overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(fontWeight: FontWeight.w600),
+                  style: const TextStyle(fontWeight: FontWeight.w800),
                 ),
                 const SizedBox(height: 2),
                 Text('${t['artist'] ?? ''}', maxLines: 1, overflow: TextOverflow.ellipsis),
@@ -789,14 +864,12 @@ class _SearchPageState extends State<SearchPage> {
             Expanded(
               child: DropdownButtonHideUnderline(
                 child: DropdownButton<int>(
-                  value: _quality,
+                  value: _quality.clamp(0, _qualities.length - 1),
                   isDense: true,
                   isExpanded: true,
-                  items: const [
-                    DropdownMenuItem(value: 0, child: Text('320k')),
-                    DropdownMenuItem(value: 1, child: Text('128k')),
-                    DropdownMenuItem(value: 2, child: Text('FLAC')),
-                    DropdownMenuItem(value: 3, child: Text('FLAC 24bit')),
+                  items: [
+                    for (var i = 0; i < _qualities.length; i++)
+                      DropdownMenuItem(value: i, child: Text(_qualityLabel(_qualities[i]))),
                   ],
                   onChanged: (v) => setState(() => _quality = v ?? 0),
                 ),
@@ -857,11 +930,12 @@ class _SearchPageState extends State<SearchPage> {
 
 /// 封面：走原生磁盘缓存（CoverCache），没加载好之前不占位置、不留灰块。
 class _CoverArt extends StatefulWidget {
-  const _CoverArt({this.url, this.size = 84, this.gap = 10});
+  const _CoverArt({this.url, this.size = 84, this.gap = 10, this.onLongPress});
 
   final String? url;
   final double size;
   final double gap;
+  final VoidCallback? onLongPress;
 
   @override
   State<_CoverArt> createState() => _CoverArtState();
@@ -908,7 +982,9 @@ class _CoverArtState extends State<_CoverArt> {
         opacity: v,
         child: Transform.scale(scale: 0.94 + 0.06 * v, child: child),
       ),
-      child: Padding(
+      child: GestureDetector(
+        onLongPress: widget.onLongPress,
+        child: Padding(
         padding: EdgeInsets.only(right: widget.gap),
         child: ClipRRect(
           borderRadius: BorderRadius.circular(12),
@@ -924,6 +1000,7 @@ class _CoverArtState extends State<_CoverArt> {
             },
             errorBuilder: (_, __, ___) => const SizedBox.shrink(),
           ),
+        ),
         ),
       ),
     );

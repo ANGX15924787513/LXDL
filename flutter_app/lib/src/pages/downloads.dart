@@ -216,7 +216,7 @@ class _DownloadsPageState extends State<DownloadsPage> {
           child: shown.isEmpty
               ? ListView(
                   physics: const AlwaysScrollableScrollPhysics(),
-                  children: const [SizedBox(height: 120), Center(child: Text('空'))],
+                  children: const [SizedBox(height: 50), Center(child: Text('什么都木有'))],
                 )
               : ListView.builder(
                   physics: const AlwaysScrollableScrollPhysics(),
@@ -281,7 +281,7 @@ class _DownloadsPageState extends State<DownloadsPage> {
                 Expanded(
                   child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                     Text(title, maxLines: 1, overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(fontWeight: FontWeight.w600)),
+                        style: const TextStyle(fontWeight: FontWeight.w800)),
                     const SizedBox(height: 2),
                     Text(artist, maxLines: 1, overflow: TextOverflow.ellipsis,
                         style: Theme.of(context).textTheme.bodySmall),
@@ -316,7 +316,8 @@ class _DownloadsPageState extends State<DownloadsPage> {
             : Row(children: [
                 Expanded(
                   child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                    Text('$title - $artist', maxLines: 1, overflow: TextOverflow.ellipsis),
+                    Text('$title - $artist', maxLines: 1, overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(fontWeight: FontWeight.w800)),
                     if (path.isNotEmpty)
                       Text(path, maxLines: 1, overflow: TextOverflow.ellipsis,
                           style: Theme.of(context).textTheme.labelSmall),

@@ -176,14 +176,19 @@ class LxdlPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAware
     }
 
     private fun createEngine(): Engine {
-        val act = activity ?: throw IllegalStateException("界面未就绪")
         val (r, p) = base()
-        val web = WebView(act)
-        web.isFocusable = false
-        val root = act.findViewById<ViewGroup>(android.R.id.content)
-            ?: throw IllegalStateException("找不到根视图")
-        root.addView(web, ViewGroup.LayoutParams(1, 1))
-        val e = Engine(act, r, h(), web, p)
+        val e = if (r.cfg.engine == "quickjs") {
+            // QuickJS：纯内存引擎，不需要 WebView / Activity
+            Engine(appCtx, r, h(), null, p)
+        } else {
+            val act = activity ?: throw IllegalStateException("界面未就绪")
+            val web = WebView(act)
+            web.isFocusable = false
+            val root = act.findViewById<ViewGroup>(android.R.id.content)
+                ?: throw IllegalStateException("找不到根视图")
+            root.addView(web, ViewGroup.LayoutParams(1, 1))
+            Engine(act, r, h(), web, p)
+        }
         e.onLog = { sendEvent("log", it) }
         e.start()
         return e
@@ -221,6 +226,23 @@ class LxdlPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAware
         when (call.method) {
             "ping" -> reply(result, true)
             "buildInfo" -> reply(result, buildInfo())
+            "qualities" -> {
+                val platform = call.argument<String>("platform") ?: "wy"
+                scope.launch {
+                    runCatching { qualitiesFor(platform) }
+                        .onSuccess { reply(result, JSONArray(it).toString()) }
+                        .onFailure { fail(result, it) }
+                }
+            }
+            "saveCover" -> {
+                val url = call.argument<String>("url") ?: ""
+                val name = call.argument<String>("name") ?: "cover"
+                scope.launch {
+                    runCatching { saveCover(url, name) }
+                        .onSuccess { reply(result, it) }
+                        .onFailure { fail(result, it) }
+                }
+            }
             "takeShare" -> {
                 val t = pendingShare
                 pendingShare = null
@@ -238,6 +260,9 @@ class LxdlPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAware
                 r.cfg.naming = o.optString("naming", r.cfg.naming)
                 r.cfg.outDir = o.optString("outDir", r.cfg.outDir)
                 r.cfg.theme = o.optString("theme", r.cfg.theme)
+                val newEngine = o.optString("engine", r.cfg.engine).let { if (it == "quickjs") "quickjs" else "webview" }
+                val engineChanged = newEngine != r.cfg.engine
+                r.cfg.engine = newEngine
                 r.cfg.lyrics = o.optBoolean("lyrics", r.cfg.lyrics)
                 r.cfg.lrcSidecar = o.optBoolean("lrcSidecar", r.cfg.lrcSidecar)
                 r.cfg.concurrency = o.optInt("concurrency", r.cfg.concurrency).coerceIn(1, 8)
@@ -245,6 +270,10 @@ class LxdlPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAware
                 r.cfg.outTree = o.optString("outTree", r.cfg.outTree)
                 r.saveCfg()
                 h().setProxy(r.cfg.proxy)
+                if (engineChanged) {
+                    teardownEngines()
+                    sendEvent("log", "已切换脚本引擎：$newEngine")
+                }
                 reply(result, true)
             }
             "sources" -> { base(); reply(result, sourcesJson().toString()) }
@@ -619,8 +648,42 @@ class LxdlPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAware
         val info = pm.getPackageInfo(appCtx.packageName, 0)
         val fmt = java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.getDefault())
         val installed = fmt.format(java.util.Date(info.lastUpdateTime))
-        "webview|${info.versionName ?: "?"}|$installed"
+        val engine = runCatching { base().first.cfg.engine }.getOrDefault("webview")
+        "$engine|${info.versionName ?: "?"}|$installed"
     }.getOrDefault("webview|?|?")
+
+    /** 每个平台支持哪些音质：问第一个支持它的音源脚本，结果缓存。 */
+    private val qualitiesCache = ConcurrentHashMap<String, List<String>>()
+
+    private suspend fun qualitiesFor(platform: String): List<String> {
+        qualitiesCache[platform]?.let { return it }
+        for (entry in base().first.listSources()) {
+            val infos = runCatching { interactiveEngine().loadScript(entry) }.getOrNull() ?: continue
+            val si = infos.firstOrNull { it.key == platform } ?: continue
+            val q = si.qualities.ifEmpty { listOf("128k", "320k") }
+            qualitiesCache[platform] = q
+            return q
+        }
+        return emptyList()
+    }
+
+    /** 单独保存一张封面。 */
+    private fun saveCover(url: String, name: String): String {
+        if (url.isBlank()) throw IllegalStateException("没有封面")
+        val bytes = CoverCache.get(appCtx, url)?.readBytes()
+            ?: h().bytes(url, mapOf("User-Agent" to UA, "Referer" to "https://music.163.com/"), 20_000)
+                .also { CoverCache.put(appCtx, url, it) }
+        if (bytes.isEmpty()) throw IllegalStateException("封面是空的")
+        val tmp = File(appCtx.cacheDir, "cover-${System.currentTimeMillis()}.jpg")
+        tmp.writeBytes(bytes)
+        return try {
+            val cfg = base().first.cfg
+            val safe = name.replace(Regex("[\\\\/:*?\"<>|]"), "_").trim().ifBlank { "cover" }
+            Exporter.export(appCtx, tmp, cfg.outDir, "$safe.jpg", "image/jpeg", cfg.outTree).display
+        } finally {
+            tmp.delete()
+        }
+    }
 
     private fun isWifi(): Boolean = runCatching {
         val cm = appCtx.getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager

@@ -48,5 +48,11 @@ dependencies {
     implementation 'androidx.core:core-ktx:1.13.1'
     implementation 'com.squareup.okhttp3:okhttp:4.12.0'
     implementation 'net.jthink:jaudiotagger:3.0.1'
+    // 可选脚本引擎：QuickJS（设置里切换，默认 WebView）
+    implementation('io.github.dokar3:quickjs-kt:1.0.5') {
+        exclude group: 'org.jetbrains.kotlinx', module: 'kotlinx-coroutines-core'
+        exclude group: 'org.jetbrains.kotlinx', module: 'kotlinx-coroutines-core-jvm'
+        exclude group: 'org.jetbrains.kotlin', module: 'kotlin-stdlib'
+    }
     implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1'
 }

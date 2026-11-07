@@ -186,7 +186,7 @@ class _LxdlAppState extends State<LxdlApp> with WidgetsBindingObserver {
       builder: (context, seed, _) => MaterialApp(
         scaffoldMessengerKey: _scaffold,
         debugShowCheckedModeBanner: false,
-        title: 'lxdl',
+        title: 'LXDL',
         theme: _themeFor(seed, Brightness.light),
         darkTheme: _themeFor(seed, Brightness.dark),
         themeMode: ThemeMode.system,
@@ -310,8 +310,8 @@ class _CoverBackdropState extends State<_CoverBackdrop> {
                   children: [
                     ImageFiltered(
                       imageFilter: ImageFilter.blur(
-                        sigmaX: 20,
-                        sigmaY: 20,
+                        sigmaX: 16,
+                        sigmaY: 16,
                         tileMode: TileMode.decal,
                       ),
                       child: Image.file(

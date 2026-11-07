@@ -16,3 +16,7 @@
 -keepclassmembers class * {
     @android.webkit.JavascriptInterface <methods>;
 }
+
+# QuickJS（可选引擎）：JNI 通过类名/方法名回调
+-keep class com.dokar.quickjs.** { *; }
+-dontwarn com.dokar.quickjs.**

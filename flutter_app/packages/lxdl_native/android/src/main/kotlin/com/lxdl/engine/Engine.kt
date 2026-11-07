@@ -9,9 +9,18 @@ import android.util.Base64
 import android.webkit.JavascriptInterface
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import com.dokar.quickjs.QuickJs
+import com.dokar.quickjs.binding.asyncFunction
+import com.dokar.quickjs.binding.function
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.Call
@@ -76,9 +85,11 @@ class Engine(
     private val ctx: Context,
     private val repo: Repo,
     private val http: Http,
-    private val web: WebView,
+    private val web: WebView?,
     private val providers: Providers
 ) {
+    /** web == null 时走 QuickJS 引擎（设置里可切换，默认 WebView）。 */
+    private val quick: Boolean = web == null
     var onLog: ((String) -> Unit)? = null
 
     private val main = Handler(Looper.getMainLooper())
@@ -88,30 +99,48 @@ class Engine(
     private val pending = ConcurrentHashMap<Int, CompletableDeferred<JSONObject>>()
     private val calls = ConcurrentHashMap<Int, Call>()
     private val seq = AtomicInteger(1)
+    // ---- 可选：QuickJS 引擎（web == null 时启用） ----
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val evalLock = Mutex()
+    private val startLock = Mutex()
+    @Volatile private var qjs: QuickJs? = null
+    @Volatile private var quickStarted = false
+    @Volatile private var quickClosed = false
+    @Volatile private var initedPayload: JSONObject? = null
+    @Volatile private var initedError: String? = null
+    private val quickTimers = ConcurrentHashMap<Long, Job>()
+
     private var activeSources: List<SourceInfo> = emptyList()
     @Volatile private var lastScriptError: String? = null
     private var loadedEntry: String? = null
 
     @SuppressLint("SetJavaScriptEnabled")
     fun start() {
+        val w = web ?: return // QuickJS 惰性初始化
         main.post {
-            web.settings.javaScriptEnabled = true
-            web.settings.domStorageEnabled = true
-            web.settings.allowFileAccess = true
-            web.webViewClient = object : WebViewClient() {
+            w.settings.javaScriptEnabled = true
+            w.settings.domStorageEnabled = true
+            w.settings.allowFileAccess = true
+            w.webViewClient = object : WebViewClient() {
                 override fun onPageFinished(view: WebView?, url: String?) {
                     if (!pageReady.isCompleted) pageReady.complete(Unit)
                 }
             }
-            web.addJavascriptInterface(Bridge(), "lxHost")
-            web.loadUrl("file:///android_asset/lx_host.html")
+            w.addJavascriptInterface(Bridge(), "lxHost")
+            w.loadUrl("file:///android_asset/lx_host.html")
         }
     }
 
     fun detach() {
+        quickClosed = true
+        quickTimers.values.forEach { runCatching { it.cancel() } }
+        quickTimers.clear()
+        runCatching { qjs?.close() }
+        qjs = null
+        val w = web ?: return
         main.post {
-            runCatching { (web.parent as? android.view.ViewGroup)?.removeView(web) }
-            runCatching { web.destroy() }
+            runCatching { (w.parent as? android.view.ViewGroup)?.removeView(w) }
+            runCatching { w.destroy() }
         }
     }
 
@@ -124,9 +153,10 @@ class Engine(
     private fun eval(js: String): String? = withLock {
         var result: String? = null
         val latch = CountDownLatch(1)
+        val w = web
         main.post {
             try {
-                web.evaluateJavascript(js) { value ->
+                w?.evaluateJavascript(js) { value ->
                     result = value
                     latch.countDown()
                 }
@@ -144,6 +174,8 @@ class Engine(
 
     /** 加载（切换）音源脚本，返回它上报的 sources。 */
     suspend fun loadScript(entry: SourceEntry): List<SourceInfo> = withContext(Dispatchers.IO) {
+        if (quick) return@withContext loadScriptQuick(entry)
+        /* ---- WebView ---- */
         withTimeoutOrNull(20_000) { pageReady.await() } ?: throw IllegalStateException("JS 引擎启动超时")
         if (loadedEntry == entry.file && activeSources.isNotEmpty()) return@withContext activeSources
         if (eval("(window.__lxReady === true) ? 1 : 0") != "1") {
@@ -181,6 +213,7 @@ class Engine(
 
     suspend fun call(source: String, action: String, info: JSONObject, timeoutMs: Int = 90_000): Any? =
         withContext(Dispatchers.IO) {
+            if (quick) return@withContext callQuick(source, action, info, timeoutMs)
             val id = seq.getAndIncrement()
             val d = CompletableDeferred<JSONObject>()
             pending[id] = d
@@ -296,7 +329,186 @@ class Engine(
         ) {
             val js = "window.__lxHttpDone($id, ${err?.let { q(it) } ?: "null"}, $status, " +
                 "${q(statusText)}, ${q(headersJson)}, ${q(bodyB64)}, $binary)"
-            main.post { runCatching { web.evaluateJavascript(js, null) } }
+            val w = web
+            main.post { runCatching { w?.evaluateJavascript(js, null) } }
+        }
+    }
+
+    // ---------------- QuickJS 实现（可选引擎，web == null 时启用） ----------------
+
+    fun engineName(): String = if (quick) "quickjs" else "webview"
+
+    private suspend fun quickEnsureStarted() {
+        if (quickStarted) return
+        startLock.lock()
+        try {
+            if (quickStarted) return
+            val q = qjs ?: QuickJs.create(Dispatchers.Default).also { qjs = it }
+            quickInstallBindings(q)
+            val shim = ctx.assets.open("lx_host.js").bufferedReader().use { it.readText() }
+            quickEval(shim, "lx_host.js")
+            quickStarted = true
+        } finally {
+            startLock.unlock()
+        }
+    }
+
+    private suspend fun quickEval(js: String, filename: String = "lx.js"): Any? {
+        if (quickClosed) throw IllegalStateException("JS 引擎已释放")
+        evalLock.lock()
+        try {
+            val q = qjs ?: throw IllegalStateException("JS 引擎未初始化")
+            return q.evaluate<Any?>(js, filename)
+        } finally {
+            evalLock.unlock()
+        }
+    }
+
+    private suspend fun loadScriptQuick(entry: SourceEntry): List<SourceInfo> {
+        quickEnsureStarted()
+        if (loadedEntry == entry.file && activeSources.isNotEmpty()) return activeSources
+        initedPayload = null
+        initedError = null
+        val code = File(repo.sourcesDir, entry.file).readText()
+        val meta = JSONObject().put("name", entry.name).put("version", entry.version)
+            .put("author", entry.author).put("rawScript", code)
+        quickEval("globalThis.__lxScriptInfo = $meta;", "meta.js")
+        val t0 = System.currentTimeMillis()
+        try {
+            withTimeoutOrNull(60_000) { quickEval("(function () {\n" + code + "\n})();", entry.file) }
+                ?: throw IllegalStateException("音源脚本执行超时（60s，脚本 ${code.length} 字符）")
+        } catch (e: IllegalStateException) {
+            android.util.Log.w("lxdl-js", "quickjs eval timeout ${System.currentTimeMillis() - t0}ms")
+            throw e
+        } catch (e: Throwable) {
+            android.util.Log.w("lxdl-js", "quickjs eval failed ${System.currentTimeMillis() - t0}ms: ${e.message}")
+            throw IllegalStateException("音源脚本执行失败：${e.message}")
+        }
+        val deadline = System.currentTimeMillis() + 30_000
+        while (initedPayload == null && initedError == null && System.currentTimeMillis() < deadline) delay(10)
+        initedError?.let { throw IllegalStateException("音源初始化失败：$it") }
+        val info = initedPayload ?: throw IllegalStateException("音源初始化超时（脚本没有上报 inited）")
+        activeSources = parseSources(info)
+        repo.notePlatforms(entry.file, activeSources.map { it.key })
+        loadedEntry = entry.file
+        return activeSources
+    }
+
+    private suspend fun callQuick(source: String, action: String, info: JSONObject, timeoutMs: Int): Any? {
+        quickEnsureStarted()
+        val id = seq.getAndIncrement()
+        val d = CompletableDeferred<JSONObject>()
+        pending[id] = d
+        val r = try {
+            withTimeoutOrNull(timeoutMs + 10_000L) {
+                quickEval("__lxAction($id, ${q(source)}, ${q(action)}, ${q(info.toString())});", "action.js")
+                d.await()
+            } ?: run { pending.remove(id); throw IllegalStateException("音源响应超时") }
+        } catch (e: IllegalStateException) {
+            pending.remove(id)
+            throw e
+        } catch (e: Throwable) {
+            pending.remove(id)
+            throw IllegalStateException("音源脚本调用失败：${e.message}")
+        }
+        if (!r.optBoolean("ok")) throw IllegalStateException(r.optString("error", "音源返回错误"))
+        return r.opt("value")
+    }
+
+    private fun quickInstallBindings(q: QuickJs) {
+        q.function<Any?>("__hostLog") { args ->
+            android.util.Log.d("lxdl-js", "[${args.getOrNull(0)}] ${args.getOrNull(1)}")
+            null
+        }
+        q.function<Any?>("__hostSend") { args ->
+            runCatching {
+                val name = args.getOrNull(0)?.toString() ?: ""
+                val o = JSONObject(args.getOrNull(1)?.toString() ?: "{}")
+                when (name) {
+                    "inited" -> initedPayload = o
+                    "updateAlert" -> log("音源提示：" + o.optString("log"))
+                    "__inited_error" -> initedError = o.optString("message")
+                    "__result" -> pending.remove(o.optInt("id"))?.complete(o)
+                }
+            }
+            null
+        }
+        q.function<String>("__hostMd5") { a -> Crypto.md5(a.getOrNull(0)?.toString() ?: "") }
+        q.function<String>("__hostAes") { a ->
+            runCatching {
+                Crypto.aes(
+                    a.getOrNull(0)?.toString() ?: "",
+                    a.getOrNull(1)?.toString() ?: "cbc",
+                    a.getOrNull(2)?.toString() ?: "",
+                    a.getOrNull(3)?.toString() ?: ""
+                )
+            }.getOrElse { "\u0001ERR:${it.message}" }
+        }
+        q.function<String>("__hostRsa") { a ->
+            runCatching {
+                Crypto.rsa(a.getOrNull(0)?.toString() ?: "", a.getOrNull(1)?.toString() ?: "")
+            }.getOrElse { "\u0001ERR:${it.message}" }
+        }
+        q.function<String>("__hostRandom") { a -> Crypto.random((a.getOrNull(0) as? Number)?.toInt() ?: 0) }
+        q.asyncFunction<String>("__hostFetch") { a ->
+            val url = a.getOrNull(0)?.toString() ?: ""
+            val opts = a.getOrNull(1)?.toString() ?: "{}"
+            withContext(Dispatchers.IO) { quickDoRequest(url, JSONObject(opts)) }
+        }
+        q.function<Long>("__hostSetTimeout") { a ->
+            val id = (a.getOrNull(0) as? Number)?.toLong() ?: 0L
+            val ms = (a.getOrNull(1) as? Number)?.toLong() ?: 0L
+            quickTimers.remove(id)?.cancel()
+            quickTimers[id] = scope.launch {
+                delay(ms.coerceIn(0L, 600_000L))
+                quickTimers.remove(id)
+                runCatching { quickEval("globalThis.__fireTimer && globalThis.__fireTimer($id);", "timer.js") }
+            }
+            id
+        }
+        q.function<Any?>("__hostClearTimeout") { a ->
+            val id = (a.getOrNull(0) as? Number)?.toLong() ?: 0L
+            quickTimers.remove(id)?.cancel()
+            null
+        }
+    }
+
+    private fun quickDoRequest(url: String, o: JSONObject): String {
+        if (!url.startsWith("http")) throw IllegalArgumentException("bad url")
+        val method = o.optString("method", "GET")
+        val timeout = o.optLong("timeout", 20_000)
+        val headers = o.optJSONObject("headers")
+        val bodyText = if (o.isNull("body")) null else o.optString("body")
+        val bodyEnc = o.optString("bodyEncoding", "text")
+        val bodyBytes = bodyText?.let {
+            if (bodyEnc == "base64") Base64.decode(it, Base64.NO_WRAP) else it.toByteArray()
+        }
+        val builder = Request.Builder().url(url).header("User-Agent", UA)
+        if (headers != null) {
+            headers.keys().forEach { k -> builder.header(k, headers.optString(k)) }
+        }
+        val ctype = headers?.let { h ->
+            h.keys().asSequence().firstOrNull { k -> k.equals("content-type", true) }
+                ?.let { k -> h.optString(k) }
+        }?.takeIf { it.isNotBlank() } ?: "application/octet-stream"
+        val media = runCatching { ctype.toMediaType() }.getOrNull()
+            ?: "application/octet-stream".toMediaType()
+        val rb = bodyBytes?.toRequestBody(media)
+        if (rb != null) builder.method(method, rb) else builder.method(method, null)
+        val call = http.client.newBuilder()
+            .callTimeout(timeout, TimeUnit.MILLISECONDS)
+            .build()
+            .newCall(builder.build())
+        call.execute().use { r ->
+            val bytes = r.body?.bytes() ?: ByteArray(0)
+            val rt = r.header("Content-Type") ?: ""
+            val binary = o.optString("responseType") == "arraybuffer" ||
+                !(rt.startsWith("text/") || rt.contains("json") || rt.contains("xml"))
+            val hdr = JSONObject()
+            r.headers.forEach { (k, v) -> hdr.put(k.lowercase(), v) }
+            return JSONObject().put("status", r.code).put("statusText", r.message)
+                .put("headers", hdr).put("body", Base64.encodeToString(bytes, Base64.NO_WRAP))
+                .put("binary", binary).toString()
         }
     }
 

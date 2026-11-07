@@ -38,6 +38,7 @@ class _SourcesPageState extends State<SourcesPage> {
   bool _lrcSidecar = false;
   String _outTree = '';
   String _theme = _defaultThemeHex;
+  String _engine = 'webview';
 
   @override
   void initState() {
@@ -60,6 +61,7 @@ class _SourcesPageState extends State<SourcesPage> {
         _outTree = cfg['outTree'] as String? ?? '';
         final t = (cfg['theme'] as String?)?.trim() ?? '';
         if (t.isNotEmpty) _theme = t.toUpperCase();
+        _engine = (cfg['engine'] as String?) == 'quickjs' ? 'quickjs' : 'webview';
       });
     } catch (_) {}
   }
@@ -336,6 +338,29 @@ class _SourcesPageState extends State<SourcesPage> {
               onPressed: _pickDir,
               icon: const Icon(Icons.folder_outlined, size: 16),
               label: Text(_outTree.isEmpty ? '导出目录：默认' : '导出目录：已选'),
+            ),
+          ]),
+          const SizedBox(height: 4),
+          Row(children: [
+            const Text('脚本引擎'),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Align(
+                alignment: Alignment.centerLeft,
+                child: SegmentedButton<String>(
+                  segments: const [
+                    ButtonSegment(value: 'webview', label: Text('WebView')),
+                    ButtonSegment(value: 'quickjs', label: Text('QuickJS')),
+                  ],
+                  selected: {_engine},
+                  showSelectedIcon: false,
+                  onSelectionChanged: (v) {
+                    final e = v.first;
+                    setState(() => _engine = e);
+                    _save({'engine': e});
+                  },
+                ),
+              ),
             ),
           ]),
           const SizedBox(height: 4),
