@@ -61,6 +61,7 @@ class _SearchPageState extends State<SearchPage> {
   List<Map<String, dynamic>> _results = [];
   int _selected = -1;
   Map<String, dynamic>? _preview;
+  static bool _warmed = false;
   int _quality = 0;
   int _namingIndex = 0;
   String _customTemplate = '{title} - {artist}';
@@ -181,7 +182,10 @@ class _SearchPageState extends State<SearchPage> {
       final list = (jsonDecode(raw) as List).cast<Map<String, dynamic>>();
       setState(() => _results = list);
       if (list.isEmpty) setState(() => _error = '没有结果');
-      if (list.isNotEmpty) await _select(0);
+      if (list.isNotEmpty) {
+        _warmUp();
+        await _select(0);
+      }
       await _refreshMirror();
     } catch (e) {
       setState(() => _error = Bridge.err(e));
@@ -218,6 +222,7 @@ class _SearchPageState extends State<SearchPage> {
         _preview = t;
       });
       widget.coverIn.value = t['cover'] as String?;
+      _warmUp();
       await _refreshMirror();
     } catch (e) {
       setState(() => _error = Bridge.err(e));
@@ -645,6 +650,13 @@ class _SearchPageState extends State<SearchPage> {
         ),
       ],
     );
+  }
+
+  /// 有过一次结果就预热引擎：WebView + 音源脚本提前跑好，点下载不用等冷启动
+  void _warmUp() {
+    if (_warmed) return;
+    _warmed = true;
+    Bridge.call('warmUp').then((_) {}, onError: (_) {});
   }
 
   /// 下拉框也包成一个圆角“输入框”，和 TextField 观感统一
