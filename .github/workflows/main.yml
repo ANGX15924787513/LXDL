@@ -43,7 +43,7 @@ jobs:
         run: rustup target add aarch64-linux-android armv7-linux-androideabi
 
       - name: Install cargo-ndk
-        uses: taiki-e/install-action@cargo-ndk
+        run: cargo install cargo-ndk --locked
 
       - name: Build rquickjs for Android
         working-directory: flutter_app/packages/lxdl_native/rust
