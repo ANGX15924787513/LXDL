@@ -220,6 +220,7 @@ class LxdlPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAware
     override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
         when (call.method) {
             "ping" -> reply(result, true)
+            "buildInfo" -> reply(result, buildInfo())
             "takeShare" -> {
                 val t = pendingShare
                 pendingShare = null
@@ -611,6 +612,15 @@ class LxdlPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAware
             }
         }
     }
+
+    /** 给界面显示用：当前用的是哪个脚本引擎 + 版本号 + 安装时间，方便确认装的是哪次构建。 */
+    private fun buildInfo(): String = runCatching {
+        val pm = appCtx.packageManager
+        val info = pm.getPackageInfo(appCtx.packageName, 0)
+        val fmt = java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.getDefault())
+        val installed = fmt.format(java.util.Date(info.lastUpdateTime))
+        "webview|${info.versionName ?: "?"}|$installed"
+    }.getOrDefault("webview|?|?")
 
     private fun isWifi(): Boolean = runCatching {
         val cm = appCtx.getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager

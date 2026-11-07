@@ -68,10 +68,13 @@ class _SourcesPageState extends State<SourcesPage> {
     try {
       final raw = await Bridge.call('sources') as String?;
       final list = (jsonDecode(raw ?? '[]') as List).cast<Map<String, dynamic>>();
+      final build = (await Bridge.call('buildInfo') as String?) ?? '';
+      final parts = build.split('|');
+      final tag = parts.length >= 3 ? '${parts[0]} v${parts[1]} · ${parts[2]}' : '';
       if (!mounted) return;
       setState(() {
         _items = list;
-        _status = '共 ${list.length} 个音源';
+        _status = tag.isEmpty ? '共 ${list.length} 个音源' : '$tag · 共 ${list.length} 个音源';
       });
     } catch (e) {
       if (mounted) setState(() => _status = Bridge.err(e));
